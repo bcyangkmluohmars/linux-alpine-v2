@@ -1,0 +1,779 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/*
+ * Device Tree Source for Ubiquiti UNVR (Network Video Recorder)
+ *
+ * Based on decompiled DTS from a running UNVR device and
+ * mainline Linux 6.12 amazon/alpine-v2.dtsi.
+ *
+ * Hardware:
+ *   SoC:     Annapurna Labs Alpine V2 (AL-314), 4x Cortex-A57
+ *   RAM:     4 GB (4 banks of 1 GB each)
+ *   Network: 1GbE RJ45 (RGMII, Marvell PHY addr 4) + 10G SFP+ (SerDes)
+ *   Storage: 2x AHCI (4 SATA ports total), 4 HDD bays
+ *   I2C:     DesignWare, PCA9546 mux, 3x PCA9575 GPIO expanders
+ *   Boot:    eMMC via USB (ASMedia xHCI on PCIe ext port 0)
+ *   Serial:  UART ttyS0 @ 115200
+ *   Board:   sysid=ea1a
+ */
+
+/dts-v1/;
+
+#include "alpine-v2.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+
+/ {
+	model = "Ubiquiti UNVR";
+	compatible = "ubnt,unvr", "al,alpine-v2";
+
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart1;
+		serial2 = &uart2;
+		serial3 = &uart3;
+	};
+
+	chosen {
+		bootargs = "pci=pcie_bus_perf console=ttyS0,115200 sysid=ea1a reboot=warm root=PARTLABEL=rootfs rootwait rw iommu.passthrough=1";
+		stdout-path = "serial0:115200n8";
+		linux,pci-probe-only = <1>;
+	};
+
+	/*
+	 * 4 GB RAM in four 1 GB banks.
+	 * Three contiguous banks at 0x0-0xBFFF_FFFF, one at 0x2_0000_0000.
+	 */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00 0x00000000 0x00 0x40000000>,
+		      <0x00 0x40000000 0x00 0x40000000>,
+		      <0x00 0x80000000 0x00 0x40000000>,
+		      <0x02 0x00000000 0x00 0x40000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		ramoops@12000000 {
+			compatible = "ramoops";
+			reg = <0x00 0x12000000 0x00 0x200000>;
+			record-size  = <0x100000>;
+			console-size = <0x10000>;
+			ftrace-size  = <0x10000>;
+			pmsg-size    = <0x80000>;
+			ecc-size     = <0x10>;
+		};
+	};
+
+	soc {
+		/*
+		 * Internal PCIe — hosts AHCI SATA, Ethernet, Crypto, DMA.
+		 * Uses our Alpine internal PCIe driver (pcie-al-internal.c)
+		 * which configures AXI sub-master snoop registers for
+		 * cache-coherent DMA. This is critical for TX (M2S) DMA
+		 * on the Ethernet adapter and other internal bus masters.
+		 */
+		pci@fbc00000 {
+			compatible = "annapurna-labs,alpine-internal-pcie";
+			dma-coherent;
+		};
+
+		/*
+		 * MSI-X controller — al,alpine-msix is the mainline compatible.
+		 */
+		msix: msix@fbe00000 {
+			compatible = "al,alpine-msix";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+		};
+
+		/* External PCIe ports are defined below in the UNVR-specific section */
+
+		/* ----------------------------------------------------------------
+		 * Nodes below are NOT in mainline alpine-v2.dtsi.
+		 * They describe UNVR-specific or Alpine V2-specific peripherals
+		 * that mainline Linux does not yet support.
+		 * ---------------------------------------------------------------- */
+
+		/* CCU (Cache Coherency Unit) */
+		ccu: ccu@f0090000 {
+			compatible = "annapurna-labs,al-ccu";
+			reg = <0x00 0xf0090000 0x00 0x10000>;
+			io_coherency = <1>;
+		};
+
+		/* NB Service (system fabric, used for error reporting) */
+		nb_service: nb-service@f0070000 {
+			compatible = "annapurna-labs,al-nb-service",
+				     "al,alpine-sysfabric-service", "syscon";
+			reg = <0x00 0xf0070000 0x00 0x10000>;
+			interrupts = <GIC_SPI 96 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 97 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 98 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 99 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/* PBS (Peripheral Bus System) */
+		pbs: pbs@fd8a8000 {
+			compatible = "annapurna-labs,al-pbs";
+			reg = <0x00 0xfd8a8000 0x00 0x1000>;
+			interrupts = <GIC_SPI 0 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/* SerDes configuration block */
+		serdes: serdes@fd8c0000 {
+			compatible = "annapurna-labs,al-serdes";
+			reg = <0x00 0xfd8c0000 0x00 0x2400>;
+		};
+
+		/* Memory controller */
+		mc: memory-controller@f0080000 {
+			compatible = "annapurna-labs,alpine-mc";
+			reg = <0x00 0xf0080000 0x00 0x10000>;
+		};
+
+		/* Thermal sensor */
+		thermal: thermal@fd860a00 {
+			compatible = "annapurna-labs,al-thermal";
+			reg = <0x00 0xfd860a00 0x00 0x100>;
+			#thermal-sensor-cells = <0>;
+		};
+
+		/* Watchdog timers (SP805) — only wdt0 enabled for reboot */
+		wdt0: watchdog@fd88c000 {
+			compatible = "arm,sp805", "arm,primecell";
+			reg = <0x00 0xfd88c000 0x00 0x1000>;
+			interrupts = <GIC_SPI 13 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		wdt1: watchdog@fd88d000 {
+			compatible = "arm,sp805", "arm,primecell";
+			reg = <0x00 0xfd88d000 0x00 0x1000>;
+			interrupts = <GIC_SPI 14 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+			status = "disabled";
+		};
+
+		wdt2: watchdog@fd88e000 {
+			compatible = "arm,sp805", "arm,primecell";
+			reg = <0x00 0xfd88e000 0x00 0x1000>;
+			interrupts = <GIC_SPI 15 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+			status = "disabled";
+		};
+
+		wdt3: watchdog@fd88f000 {
+			compatible = "arm,sp805", "arm,primecell";
+			reg = <0x00 0xfd88f000 0x00 0x1000>;
+			interrupts = <GIC_SPI 16 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+			status = "disabled";
+		};
+
+		/* Reboot controller (triggers watchdog reset) */
+		reboot: reboot {
+			compatible = "annapurna-labs,alpine-reboot";
+			wdt-parent = <&wdt0>;
+		};
+
+		/* GPIO controllers (PL061) — 6 banks, 8 pins each */
+		gpio0: gpio@fd887000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd887000 0x00 0x1000>;
+			interrupts = <GIC_SPI 2 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio1: gpio@fd888000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd888000 0x00 0x1000>;
+			interrupts = <GIC_SPI 3 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio2: gpio@fd889000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd889000 0x00 0x1000>;
+			interrupts = <GIC_SPI 4 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio3: gpio@fd88a000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd88a000 0x00 0x1000>;
+			interrupts = <GIC_SPI 5 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio4: gpio@fd88b000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd88b000 0x00 0x1000>;
+			interrupts = <GIC_SPI 6 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio5: gpio@fd897000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd897000 0x00 0x1000>;
+			interrupts = <GIC_SPI 7 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		/* SGPO (Serial GPIO Output) — drives SATA activity LEDs */
+		sgpo: sgpo@fd8b4000 {
+			compatible = "annapurna-labs,alpine-sgpo";
+			reg = <0x00 0xfd8b4000 0x00 0x5000>;
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		/*
+		 * I2C bus "i2c-pld" (DesignWare)
+		 *
+		 * SB clock: 500 MHz, bus frequency: 100 kHz (standard mode)
+		 * Hosts PCA9546 mux and PCA9575 GPIO expanders for HDD control.
+		 */
+		i2c_pld: i2c@fd880000 {
+			compatible = "snps,designware-i2c";
+			reg = <0x00 0xfd880000 0x00 0x1000>;
+			interrupts = <GIC_SPI 21 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-frequency = <100000>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* PCA9546 4-channel I2C mux */
+			i2c_mux: i2c-mux@71 {
+				compatible = "nxp,pca9546";
+				reg = <0x71>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				/* Channel 0: RTC (Seiko S-35390A) */
+				i2c@0 {
+					reg = <0>;
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					rtc@30 {
+						compatible = "sii,s35390a";
+						reg = <0x30>;
+					};
+				};
+
+				/* Channel 3: ADT7475 hardware monitor */
+				i2c@3 {
+					reg = <3>;
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					hwmon@2e {
+						compatible = "adi,adt7475";
+						reg = <0x2e>;
+					};
+				};
+			};
+
+			/*
+			 * PCA9575 GPIO expander #0 (addr 0x20)
+			 * Pin 2: SFP+ 1G link LED
+			 */
+			i2c_gpio0: gpio@20 {
+				compatible = "nxp,pca9575";
+				reg = <0x20>;
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+
+			/*
+			 * PCA9575 GPIO expander #1 (addr 0x21)
+			 * HDD bay control:
+			 *   Pins 0-3:   power enable (bays 1-4)
+			 *   Pins 4-7:   presence detect (bays 1-4, active low)
+			 *   Pins 12-15: fault LEDs (bays 1-4)
+			 */
+			i2c_gpio1: gpio@21 {
+				compatible = "nxp,pca9575";
+				reg = <0x21>;
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+
+			/* PCA9575 GPIO expander #2 (addr 0x29) */
+			i2c_gpio2: gpio@29 {
+				compatible = "nxp,pca9575";
+				reg = <0x29>;
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+		};
+
+		/* I2C general-purpose bus (disabled on UNVR) */
+		i2c_gen: i2c@fd894000 {
+			compatible = "snps,designware-i2c";
+			reg = <0x00 0xfd894000 0x00 0x1000>;
+			interrupts = <GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-frequency = <100000>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		/* Pinctrl — mux function selection for SoC pads */
+		pinctrl: pinctrl@fd8a8000 {
+			compatible = "annapurna-labs,alpine-pinctrl";
+			reg = <0x00 0xfd8a8000 0x00 0x1000>;
+		};
+
+		/*
+		 * Ethernet ports (Annapurna Labs out-of-tree al_eth driver)
+		 *
+		 * Port 0: disabled
+		 * Port 1: 1GbE RJ45 — RGMII mode, Marvell PHY at MDIO address 4
+		 * Port 2: 10G SFP+ — SerDes group 3 lane 0, auto-detect speed
+		 * Port 3: disabled
+		 *
+		 * Registers are in the io-fabric address space (base 0xfc000000).
+		 * Each port occupies a 1MB region at 0xfc000000 + (port * 0x100000).
+		 */
+		eth0: ethernet@fc000000 {
+			compatible = "annapurna-labs,al-eth";
+			reg = <0x00 0xfc000000 0x00 0x1000>;
+			interrupts = <GIC_SPI 61 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		eth1: ethernet@fc100000 {
+			compatible = "annapurna-labs,al-eth";
+			reg = <0x00 0xfc100000 0x00 0x1000>;
+			interrupts = <GIC_SPI 62 IRQ_TYPE_LEVEL_HIGH>;
+			/* 1GbE RGMII with external Marvell PHY */
+			port-id = <1>;
+			phy-mode = "rgmii";
+			phy-addr = <4>;
+			mdio-freq-khz = <1000>;
+			auto-neg-mode = "out-of-band";
+			status = "okay";
+		};
+
+		eth2: ethernet@fc200000 {
+			compatible = "annapurna-labs,al-eth";
+			reg = <0x00 0xfc200000 0x00 0x1000>;
+			interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>;
+			/* 10G SFP+ via SerDes */
+			port-id = <2>;
+			phy-mode = "10gbase-r";
+			serdes-grp = <3>;
+			serdes-lane = <0>;
+			dac-length = <3>;
+			auto-neg = "disabled";
+			link-training = "disabled";
+			fec = "disabled";
+			force-1000base-x = "enabled";
+			status = "okay";
+		};
+
+		eth3: ethernet@fc300000 {
+			compatible = "annapurna-labs,al-eth";
+			reg = <0x00 0xfc300000 0x00 0x1000>;
+			interrupts = <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH>;
+			status = "disabled";
+		};
+
+		/*
+		 * External PCIe port 0 — enabled
+		 * ASMedia xHCI USB 3.0 host (eMMC boot device + Bluetooth dongle)
+		 * SPI 41 = 0x29
+		 */
+		/*
+		 * External PCIe port 0 — xHCI USB (eMMC + Bluetooth)
+		 * Uses patched pcie-al.c with pre-set dbi_base to avoid
+		 * DWC framework resource conflict on Alpine V2.
+		 */
+		pcie_ext0: pcie@fd800000 {
+			compatible = "amazon,al-alpine-v2-pcie";
+			device_type = "pci";
+			reg = <0x00 0xfd800000 0x00 0x10000>,
+			      <0x00 0xfb600000 0x00 0x100000>;
+			reg-names = "controller", "config";
+			dma-coherent;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			interrupt-parent = <&gic>;
+			interrupt-map-mask = <0x00 0x00 0x00 0x07>;
+			interrupt-map = <0x00 0x00 0x00 0x01
+					 &gic 0 41 IRQ_TYPE_LEVEL_HIGH>;
+			msi-parent = <&msix>;
+			ranges = <0x02000000 0x00 0xc0010000
+				  0x00 0xc0010000 0x00 0x7ff0000>,
+				 <0x01000000 0x00 0x00010000
+				  0x00 0xc0000000 0x00 0x10000>;
+			bus-range = <0x00 0xff>;
+			linux,pci-domain = <1>;
+			status = "okay";
+		};
+
+		/* External PCIe ports 1-3 — disabled on UNVR */
+		pcie_external1: pcie-external1 {
+			compatible = "pci-host-ecam-generic";
+			device_type = "pci";
+			reg = <0x00 0xfd820000 0x00 0x20000>;
+			reg-names = "ecam";
+			dma-coherent;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			interrupt-parent = <&gic>;
+			interrupt-map-mask = <0x00 0x00 0x00 0x07>;
+			interrupt-map = <0x00 0x00 0x00 0x01
+					 &gic 0 42 IRQ_TYPE_LEVEL_HIGH>;
+			msi-parent = <&msix>;
+			cfg-space-offset = <0x2000>;
+			ranges = <0x00000000 0x00 0xfb700000
+				  0x00 0xfb700000 0x00 0x100000>,
+				 <0x01000000 0x00 0x00020000
+				  0x00 0xc8000000 0x00 0x10000>,
+				 <0x02000000 0x00 0xc8010000
+				  0x00 0xc8010000 0x00 0x7ff0000>;
+			bus-range = <0x00 0xff>;
+			status = "disabled";
+		};
+
+		pcie_external2: pcie-external2 {
+			compatible = "pci-host-ecam-generic";
+			device_type = "pci";
+			reg = <0x00 0xfd840000 0x00 0x20000>;
+			reg-names = "ecam";
+			dma-coherent;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			interrupt-parent = <&gic>;
+			interrupt-map-mask = <0x00 0x00 0x00 0x07>;
+			interrupt-map = <0x00 0x00 0x00 0x01
+					 &gic 0 43 IRQ_TYPE_LEVEL_HIGH>;
+			msi-parent = <&msix>;
+			cfg-space-offset = <0x2000>;
+			ranges = <0x00000000 0x00 0xfb800000
+				  0x00 0xfb800000 0x00 0x100000>,
+				 <0x01000000 0x00 0x00030000
+				  0x00 0xd0000000 0x00 0x10000>,
+				 <0x02000000 0x00 0xd0010000
+				  0x00 0xd0010000 0x00 0x7ff0000>;
+			bus-range = <0x00 0xff>;
+			status = "disabled";
+		};
+
+		pcie_external3: pcie-external3 {
+			compatible = "pci-host-ecam-generic";
+			device_type = "pci";
+			reg = <0x00 0xfd900000 0x00 0x20000>;
+			reg-names = "ecam";
+			dma-coherent;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			interrupt-parent = <&gic>;
+			interrupt-map-mask = <0x00 0x00 0x00 0x07>;
+			interrupt-map = <0x00 0x00 0x00 0x01
+					 &gic 0 44 IRQ_TYPE_LEVEL_HIGH>;
+			msi-parent = <&msix>;
+			cfg-space-offset = <0x2000>;
+			ranges = <0x00000000 0x00 0xfb900000
+				  0x00 0xfb900000 0x00 0x100000>,
+				 <0x01000000 0x00 0x00040000
+				  0x00 0xd8000000 0x00 0x10000>,
+				 <0x02000000 0x00 0xd8010000
+				  0x00 0xd8010000 0x00 0x7ff0000>;
+			bus-range = <0x00 0xff>;
+			status = "disabled";
+		};
+
+		/*
+		 * SPI flash controller (DesignWare SSI)
+		 * Partition layout: U-Boot, env, factory data, recovery kernel
+		 */
+		spi: spi@fd882000 {
+			compatible = "amazon,alpine-dw-apb-ssi",
+				     "snps,dw-spi-mmio", "snps,dw-apb-ssi";
+			reg = <0x00 0xfd882000 0x00 0x1000>;
+			interrupts = <GIC_SPI 23 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "sbclk";
+			num-cs = <4>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			flash@0 {
+				compatible = "jedec,spi-nor";
+				reg = <0>;
+				spi-max-frequency = <37500000>;
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				partition@0 {
+					reg = <0x000000 0x1c0000>;
+					label = "u-boot";
+				};
+
+				partition@1c0000 {
+					reg = <0x1c0000 0x10000>;
+					label = "u-boot-env";
+				};
+
+				partition@1d0000 {
+					reg = <0x1d0000 0x10000>;
+					label = "u-boot-env-redundant";
+				};
+
+				partition@1e0000 {
+					reg = <0x1e0000 0x10000>;
+					label = "factory";
+					read-only;
+				};
+
+				partition@1f0000 {
+					reg = <0x1f0000 0x10000>;
+					label = "eeprom";
+					read-only;
+				};
+
+				partition@200000 {
+					reg = <0x200000 0x1000000>;
+					label = "recovery";
+				};
+
+				partition@1200000 {
+					reg = <0x1200000 0xe00000>;
+					label = "config";
+				};
+			};
+		};
+
+		/* NAND flash controller (disabled — UNVR boots from SPI + eMMC) */
+		nand: nand@fa100000 {
+			compatible = "annapurna-labs,al-nand";
+			reg = <0x00 0xfa100000 0x00 0x202000>;
+			interrupts = <GIC_SPI 1 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "sbclk";
+			#address-cells = <1>;
+			#size-cells = <1>;
+			status = "disabled";
+		};
+	};
+
+	/* Thermal zone — critical shutdown at 105 C */
+	thermal-zones {
+		cpu-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&thermal>;
+
+			trips {
+				cpu_crit: cpu-crit {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+		};
+	};
+
+	/*
+	 * GPIO keys — active-low reset button on GPIO4 pin 6
+	 * KEY_RESTART = 0x198 = 408
+	 */
+	gpio-keys {
+		compatible = "gpio-keys";
+
+		button-restart {
+			label = "Reset Button";
+			linux,code = <KEY_RESTART>;
+			debounce-interval = <200>;
+			gpios = <&gpio4 6 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	/*
+	 * Front panel "U" logo LEDs (active-low)
+	 *
+	 * ulogo_blue:  GPIO3 pin 7
+	 * ulogo_white: GPIO4 pin 5
+	 */
+	leds {
+		compatible = "gpio-leds";
+
+		led-ulogo-blue {
+			label = "ulogo_blue";
+			gpios = <&gpio3 7 GPIO_ACTIVE_LOW>;
+			linux,default-trigger = "default-on";
+		};
+
+		led-ulogo-white {
+			label = "ulogo_white";
+			gpios = <&gpio4 5 GPIO_ACTIVE_LOW>;
+		};
+	};
+
+	/*
+	 * Ubiquiti "U" logo control — brightness/pattern orchestrator
+	 * This is a Ubiquiti-specific driver node.
+	 */
+	leds-ulogo {
+		compatible = "leds-ulogo";
+		default_pattern = "2:500 0:500";
+		label = "ulogo_ctrl";
+	};
+
+	/*
+	 * HDD bay power control (Ubiquiti custom driver)
+	 *
+	 * All signals routed through I2C GPIO expander #1 (PCA9575 at 0x21):
+	 *   Pins 0-3:   power enable for bays 1-4 (active high)
+	 *   Pins 4-7:   presence detect for bays 1-4 (active low)
+	 *   Pins 12-15: fault LEDs for bays 1-4 (active high)
+	 *
+	 * Force-power-on workaround: GPIO5 pin 2 (active high)
+	 */
+	hdd-pwrctl {
+		compatible = "ui,hdd-pwrctl";
+		force-power-on-wa = <&gpio5 2 GPIO_ACTIVE_HIGH>;
+
+		hdd@0 {
+			slot-no = <1>;
+			pwren     = <&i2c_gpio1 0 GPIO_ACTIVE_HIGH>;
+			present   = <&i2c_gpio1 4 GPIO_ACTIVE_LOW>;
+			fault-led = <&i2c_gpio1 12 GPIO_ACTIVE_HIGH>;
+		};
+
+		hdd@1 {
+			slot-no = <2>;
+			pwren     = <&i2c_gpio1 1 GPIO_ACTIVE_HIGH>;
+			present   = <&i2c_gpio1 5 GPIO_ACTIVE_LOW>;
+			fault-led = <&i2c_gpio1 13 GPIO_ACTIVE_HIGH>;
+		};
+
+		hdd@2 {
+			slot-no = <3>;
+			pwren     = <&i2c_gpio1 2 GPIO_ACTIVE_HIGH>;
+			present   = <&i2c_gpio1 6 GPIO_ACTIVE_LOW>;
+			fault-led = <&i2c_gpio1 14 GPIO_ACTIVE_HIGH>;
+		};
+
+		hdd@3 {
+			slot-no = <4>;
+			pwren     = <&i2c_gpio1 3 GPIO_ACTIVE_HIGH>;
+			present   = <&i2c_gpio1 7 GPIO_ACTIVE_LOW>;
+			fault-led = <&i2c_gpio1 15 GPIO_ACTIVE_HIGH>;
+		};
+	};
+
+	/*
+	 * SATA activity/presence LEDs — driven via SGPO controller
+	 *
+	 * Maps SGPO output pins to AHCI host/port combinations:
+	 *   SGPO pin 16 → AHCI host 0 (PCI 00:08.0), port 0 → bay 3
+	 *   SGPO pin 18 → AHCI host 0 (PCI 00:08.0), port 2 → bay 4
+	 *   SGPO pin 20 → AHCI host 1 (PCI 00:09.0), port 0 → bay 2
+	 *   SGPO pin 22 → AHCI host 1 (PCI 00:09.0), port 2 → bay 1
+	 */
+	sata-leds {
+		compatible = "annapurna-labs,al-sata-sw-leds";
+
+		led@0 {
+			label = "sata:host0:port0";
+			pci_domain = <0>;
+			pci_bus = <0>;
+			pci_dev = <0x08>;
+			port = <0>;
+			gpios = <&sgpo 16 GPIO_ACTIVE_HIGH>;
+			slot-no = <3>;
+		};
+
+		led@1 {
+			label = "sata:host0:port2";
+			pci_domain = <0>;
+			pci_bus = <0>;
+			pci_dev = <0x08>;
+			port = <2>;
+			gpios = <&sgpo 18 GPIO_ACTIVE_HIGH>;
+			slot-no = <4>;
+		};
+
+		led@2 {
+			label = "sata:host1:port0";
+			pci_domain = <0>;
+			pci_bus = <0>;
+			pci_dev = <0x09>;
+			port = <0>;
+			gpios = <&sgpo 20 GPIO_ACTIVE_HIGH>;
+			slot-no = <2>;
+		};
+
+		led@3 {
+			label = "sata:host1:port2";
+			pci_domain = <0>;
+			pci_bus = <0>;
+			pci_dev = <0x09>;
+			port = <2>;
+			gpios = <&sgpo 22 GPIO_ACTIVE_HIGH>;
+			slot-no = <1>;
+		};
+	};
+};
+
+/*
+ * DTSI overrides — enable specific UARTs from the mainline DTSI
+ *
+ * The DTSI defines uart0-uart3 inside io-fabric@fc000000 with addresses
+ * relative to the fabric base. Example: uart0 at offset 0x1883000 maps to
+ * absolute 0xfd883000 (fabric base 0xfc000000 + 0x1883000).
+ */
+
+/*
+ * Override sbclk frequency from the DTSI.
+ * The DTSI defines sbclk at 1 MHz (placeholder); the real Alpine V2
+ * SB clock on the UNVR runs at 500 MHz. This is critical for correct
+ * UART baud rate generation, timer operation, and I2C timing.
+ */
+&sbclk {
+	clock-frequency = <500000000>;
+};
+
+/* UART0: serial console (ttyS0 @ 115200) */
+&uart0 {
+	status = "okay";
+};
+
+/* UART2: active (Bluetooth CSR module) */
+&uart2 {
+	status = "okay";
+};

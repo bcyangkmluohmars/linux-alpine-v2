@@ -81,31 +81,24 @@ jobs:
             >> "${KDIR}/drivers/pci/controller/Makefile"
 
           # Add PCIE_AL_INTERNAL Kconfig entry (insert before last endmenu)
-          TAB=$'\t'
-          cat > /tmp/kconfig_entry << KEOF
-
-config PCIE_AL_INTERNAL
-${TAB}bool "Annapurna Labs Alpine V2 internal PCIe host controller"
-${TAB}depends on ARM64
-${TAB}depends on PCI
-${TAB}select PCI_HOST_COMMON
-${TAB}help
-${TAB}  Internal PCIe host controller for Annapurna Labs Alpine V2 SoC.
-${TAB}  Configures AXI SMCC snoop registers for cache-coherent DMA on
-${TAB}  integrated peripherals (SATA, Ethernet, crypto, RAID/DMA).
-
-KEOF
           python3 -c "
-with open('/tmp/kconfig_entry') as f:
-    entry = f.read()
-path = '${KDIR}/drivers/pci/controller/Kconfig'
-with open(path) as f:
-    content = f.read()
-pos = content.rfind('endmenu')
-content = content[:pos] + entry + content[pos:]
-with open(path, 'w') as f:
-    f.write(content)
-"
+          entry = '\nconfig PCIE_AL_INTERNAL\n'
+          entry += '\tbool \"Annapurna Labs Alpine V2 internal PCIe host controller\"\n'
+          entry += '\tdepends on ARM64\n'
+          entry += '\tdepends on PCI\n'
+          entry += '\tselect PCI_HOST_COMMON\n'
+          entry += '\thelp\n'
+          entry += '\t  Internal PCIe host controller for Annapurna Labs Alpine V2 SoC.\n'
+          entry += '\t  Configures AXI SMCC snoop registers for cache-coherent DMA on\n'
+          entry += '\t  integrated peripherals (SATA, Ethernet, crypto, RAID/DMA).\n\n'
+          path = '${KDIR}/drivers/pci/controller/Kconfig'
+          with open(path) as f:
+              content = f.read()
+          pos = content.rfind('endmenu')
+          content = content[:pos] + entry + content[pos:]
+          with open(path, 'w') as f:
+              f.write(content)
+          "
 
       - name: Build kernel
         run: |

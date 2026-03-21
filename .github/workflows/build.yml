@@ -1,0 +1,246 @@
+name: Build & Release
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      kernel_version:
+        description: 'Linux kernel version (e.g. 6.12.77)'
+        default: ''
+
+env:
+  KERNEL_VERSION: '6.12.77'
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    outputs:
+      kernel_version: ${{ steps.resolve.outputs.kernel_version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve kernel version
+        id: resolve
+        run: |
+          KV="${KERNEL_VERSION}"
+          if [ -n "${{ inputs.kernel_version }}" ]; then
+            KV="${{ inputs.kernel_version }}"
+          fi
+          echo "kernel_version=${KV}" >> "$GITHUB_OUTPUT"
+          echo "KERNEL_VERSION=${KV}" >> "$GITHUB_ENV"
+
+      - name: Install cross-compilation toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            gcc-aarch64-linux-gnu binutils-aarch64-linux-gnu \
+            bc bison flex libssl-dev libelf-dev kmod cpio \
+            device-tree-compiler python3 u-boot-tools
+
+      - name: Cache kernel source
+        uses: actions/cache@v4
+        id: kernel-cache
+        with:
+          path: linux-${{ env.KERNEL_VERSION }}.tar.xz
+          key: kernel-src-${{ env.KERNEL_VERSION }}
+
+      - name: Download kernel source
+        if: steps.kernel-cache.outputs.cache-hit != 'true'
+        run: |
+          MAJOR="${KERNEL_VERSION%%.*}"
+          curl -fLO "https://cdn.kernel.org/pub/linux/kernel/v${MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz"
+
+      - name: Extract and prepare kernel tree
+        run: |
+          tar xf "linux-${KERNEL_VERSION}.tar.xz"
+          KDIR="linux-${KERNEL_VERSION}"
+
+          # --- Defconfig ---
+          cp configs/unvr_defconfig "${KDIR}/arch/arm64/configs/unvr_defconfig"
+
+          # --- Device tree source ---
+          cp dts/*.dts "${KDIR}/arch/arm64/boot/dts/amazon/"
+          echo 'dtb-$(CONFIG_ARCH_ALPINE) += alpine-v2-ubnt-unvr.dtb' \
+            >> "${KDIR}/arch/arm64/boot/dts/amazon/Makefile"
+
+          # --- PCIe patches ---
+          # Replace mainline pcie-al.c with DBI-offset-fixed version
+          cp patches/pcie-al-dbi-fix.c \
+            "${KDIR}/drivers/pci/controller/dwc/pcie-al.c"
+
+          # Add internal PCIe host controller driver (new file)
+          cp patches/pcie-al-internal.c \
+            "${KDIR}/drivers/pci/controller/pcie-al-internal.c"
+
+          # Add build rule for pcie-al-internal
+          echo 'obj-$(CONFIG_PCIE_AL_INTERNAL)		+= pcie-al-internal.o' \
+            >> "${KDIR}/drivers/pci/controller/Makefile"
+
+          # Add PCIE_AL_INTERNAL Kconfig entry (insert before last endmenu)
+          TAB=$'\t'
+          cat > /tmp/kconfig_entry << KEOF
+
+config PCIE_AL_INTERNAL
+${TAB}bool "Annapurna Labs Alpine V2 internal PCIe host controller"
+${TAB}depends on ARM64
+${TAB}depends on PCI
+${TAB}select PCI_HOST_COMMON
+${TAB}help
+${TAB}  Internal PCIe host controller for Annapurna Labs Alpine V2 SoC.
+${TAB}  Configures AXI SMCC snoop registers for cache-coherent DMA on
+${TAB}  integrated peripherals (SATA, Ethernet, crypto, RAID/DMA).
+
+KEOF
+          python3 -c "
+with open('/tmp/kconfig_entry') as f:
+    entry = f.read()
+path = '${KDIR}/drivers/pci/controller/Kconfig'
+with open(path) as f:
+    content = f.read()
+pos = content.rfind('endmenu')
+content = content[:pos] + entry + content[pos:]
+with open(path, 'w') as f:
+    f.write(content)
+"
+
+      - name: Build kernel
+        run: |
+          make -C "linux-${KERNEL_VERSION}" \
+            ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            unvr_defconfig
+          make -C "linux-${KERNEL_VERSION}" \
+            ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            -j"$(nproc)" Image dtbs modules
+
+      - name: Create uImage
+        run: |
+          mkimage -A arm64 -O linux -T kernel -C none \
+            -a 0x00080000 -e 0x00080000 \
+            -n "Linux ${KERNEL_VERSION} Alpine V2" \
+            -d "linux-${KERNEL_VERSION}/arch/arm64/boot/Image" \
+            "linux-${KERNEL_VERSION}/uImage"
+
+      - name: Build out-of-tree modules
+        run: |
+          KDIR="$(pwd)/linux-${KERNEL_VERSION}"
+          for mod in al_eth al_dma al_ssm al_sgpo; do
+            MDIR="/tmp/build-${mod}"
+            cp -a "modules/${mod}" "${MDIR}"
+            make -C "${KDIR}" \
+              ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+              W=0 M="${MDIR}" modules
+          done
+
+      - name: Collect release artifacts
+        id: collect
+        run: |
+          KDIR="linux-${KERNEL_VERSION}"
+          REF="${GITHUB_REF_NAME}"
+          [[ "${REF}" == v* ]] || REF="dev-$(git rev-parse --short HEAD)"
+
+          OUTDIR="linux-alpine-v2-${REF}"
+          mkdir -p "${OUTDIR}"
+
+          # --- Boot files ---
+          cp "${KDIR}/uImage" "${OUTDIR}/"
+          cp "${KDIR}/arch/arm64/boot/Image" "${OUTDIR}/"
+          cp "${KDIR}/arch/arm64/boot/dts/amazon/"*.dtb "${OUTDIR}/"
+
+          # --- In-tree modules (stripped, standard lib/modules layout) ---
+          make -C "${KDIR}" \
+            ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            INSTALL_MOD_PATH="$(pwd)/${OUTDIR}" \
+            INSTALL_MOD_STRIP=1 \
+            modules_install
+
+          # --- Out-of-tree modules → lib/modules/<ver>/extra/ ---
+          MODDIR="${OUTDIR}/lib/modules/${KERNEL_VERSION}/extra"
+          mkdir -p "${MODDIR}"
+          for mod in al_eth al_dma al_ssm al_sgpo; do
+            find "/tmp/build-${mod}" -name '*.ko' -exec cp {} "${MODDIR}/" \;
+          done
+          aarch64-linux-gnu-strip --strip-unneeded "${MODDIR}"/*.ko
+
+          # --- Regenerate module dependencies ---
+          depmod -b "$(pwd)/${OUTDIR}" "${KERNEL_VERSION}"
+
+          # --- Remove build/source symlinks (point nowhere outside the tree) ---
+          rm -f "${OUTDIR}/lib/modules/${KERNEL_VERSION}/build"
+          rm -f "${OUTDIR}/lib/modules/${KERNEL_VERSION}/source"
+
+          # --- Symbol map ---
+          cp "${KDIR}/System.map" "${OUTDIR}/"
+
+          # --- Checksums ---
+          (cd "${OUTDIR}" && find . -type f ! -name SHA256SUMS -exec sha256sum {} + | sort -k2) \
+            > "${OUTDIR}/SHA256SUMS"
+
+          # --- Tarball ---
+          tar czf "${OUTDIR}.tar.gz" "${OUTDIR}"
+          echo "ARTIFACT=${OUTDIR}.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-alpine-v2
+          path: ${{ env.ARTIFACT }}
+          compression-level: 0
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: linux-alpine-v2
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: linux-alpine-v2-*.tar.gz
+          generate_release_notes: true
+          body: |
+            ## Linux ${{ needs.build.outputs.kernel_version }} for Alpine V2
+
+            Pre-built kernel and modules for Annapurna Labs Alpine V2 (AL-314) SoC.
+            All Alpine V2 devices use U-Boot — flash `uImage` + DTB to your kernel partition.
+
+            ### Contents
+
+            | File | Description |
+            |------|-------------|
+            | `uImage` | U-Boot kernel image (bootm) |
+            | `Image` | Raw ARM64 kernel binary (booti) |
+            | `alpine-v2-ubnt-unvr.dtb` | Device tree blob (Ubiquiti UNVR) |
+            | `lib/modules/*/extra/al_eth.ko` | 1GbE + 10GbE Ethernet |
+            | `lib/modules/*/extra/al_dma.ko` | RAID5/6 HW parity (XOR/PQ) |
+            | `lib/modules/*/extra/al_ssm.ko` | HW AES-XTS/CBC crypto |
+            | `lib/modules/*/extra/al_sgpo.ko` | Serial GPIO (HDD LEDs) |
+            | `lib/modules/*/kernel/` | In-tree kernel modules |
+            | `System.map` | Kernel symbol map |
+            | `SHA256SUMS` | File checksums |
+
+            ### Quick Start
+
+            ```bash
+            tar xzf linux-alpine-v2-*.tar.gz
+            # Copy to device
+            scp uImage alpine-v2-ubnt-unvr.dtb root@<device>:/boot/
+            scp -r lib/modules/* root@<device>:/lib/modules/
+            # On the device
+            depmod -a && reboot
+            ```
+
+            ### Supported Hardware
+
+            - Ubiquiti UNVR / UNAS / UDM-Pro
+            - QNAP TS-x32x series
+            - MikroTik RB1100AHx4

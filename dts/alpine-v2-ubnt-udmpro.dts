@@ -1,0 +1,506 @@
+// SPDX-License-Identifier: GPL-2.0-or-later OR MIT
+/*
+ * Device Tree Source for Ubiquiti UniFi Dream Machine Pro (UDM-Pro)
+ *
+ * Based on live device analysis (4.19.152-ui-alpine) and
+ * mainline Linux 6.12 amazon/alpine-v2.dtsi.
+ *
+ * Hardware:
+ *   SoC:     Annapurna Labs Alpine V2 (AL-314), 4x Cortex-A57
+ *   RAM:     4 GB
+ *   Network: 2x 1GbE (1 WAN RJ45, 1 switch uplink) + 2x 10G SFP+
+ *   Switch:  RTL8370MB 8-port GbE (I2C managed via al_eth)
+ *   Storage: 1x AHCI SATA (single HDD bay)
+ *   Display: LCM front panel via USB serial (/dev/ttyACM0)
+ *   I2C:     DesignWare, PCA9546 mux, PCA9575 GPIO expander
+ *   Boot:    eMMC via USB (ASMedia xHCI on PCIe ext port 0)
+ *   Serial:  UART ttyS0 @ 115200
+ *   Board:   boardid=ea15
+ */
+
+/dts-v1/;
+
+#include "alpine-v2.dtsi"
+#include <dt-bindings/gpio/gpio.h>
+
+/ {
+	model = "Ubiquiti UniFi Dream Machine Pro";
+	compatible = "ubnt,udm-pro", "al,alpine-v2";
+
+	aliases {
+		serial0 = &uart0;
+		serial1 = &uart1;
+		serial2 = &uart2;
+		serial3 = &uart3;
+	};
+
+	chosen {
+		bootargs = "pci=pcie_bus_perf console=ttyS0,115200 boardid=ea15 reboot=warm root=PARTLABEL=rootfs rootwait rw iommu.passthrough=1";
+		stdout-path = "serial0:115200n8";
+		linux,pci-probe-only = <1>;
+	};
+
+	/*
+	 * 4 GB RAM — verify exact layout on target.
+	 * UDM Pro may have different bank layout than UNVR.
+	 * Stock DTS suggests 3.5 GB visible (top 512 MB reserved).
+	 */
+	memory@0 {
+		device_type = "memory";
+		reg = <0x00 0x00000000 0x00 0x40000000>,
+		      <0x00 0x40000000 0x00 0x40000000>,
+		      <0x00 0x80000000 0x00 0x40000000>,
+		      <0x00 0xc0000000 0x00 0x20000000>;
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		ramoops@12000000 {
+			compatible = "ramoops";
+			reg = <0x00 0x12000000 0x00 0x200000>;
+			record-size  = <0x100000>;
+			console-size = <0x10000>;
+			ftrace-size  = <0x10000>;
+			pmsg-size    = <0x80000>;
+			ecc-size     = <0x10>;
+		};
+	};
+
+	soc {
+		/*
+		 * Internal PCIe — hosts Ethernet MACs, Crypto, DMA, SATA.
+		 * Uses our Alpine internal PCIe driver (pcie-al-internal.c)
+		 * which configures AXI sub-master snoop registers for
+		 * cache-coherent DMA.
+		 */
+		pci@fbc00000 {
+			compatible = "annapurna-labs,alpine-internal-pcie";
+			dma-coherent;
+		};
+
+		/* MSI-X controller — needs interrupt-controller + cells for 6.12 */
+		msix: msix@fbe00000 {
+			compatible = "al,alpine-msix";
+			interrupt-controller;
+			#interrupt-cells = <1>;
+		};
+
+		/* CCU (Cache Coherency Unit) */
+		ccu: ccu@f0090000 {
+			compatible = "annapurna-labs,al-ccu";
+			reg = <0x00 0xf0090000 0x00 0x10000>;
+			io_coherency = <1>;
+		};
+
+		/* NB Service (system fabric) */
+		nb_service: nb-service@f0070000 {
+			compatible = "annapurna-labs,al-nb-service",
+				     "al,alpine-sysfabric-service", "syscon";
+			reg = <0x00 0xf0070000 0x00 0x10000>;
+			interrupts = <GIC_SPI 96 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 97 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 98 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 99 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/* PBS (Peripheral Bus System) */
+		pbs: pbs@fd8a8000 {
+			compatible = "annapurna-labs,al-pbs";
+			reg = <0x00 0xfd8a8000 0x00 0x1000>;
+			interrupts = <GIC_SPI 0 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/* SerDes configuration */
+		serdes: serdes@fd8c0000 {
+			compatible = "annapurna-labs,al-serdes";
+			reg = <0x00 0xfd8c0000 0x00 0x2400>;
+		};
+
+		/* Memory controller */
+		mc: memory-controller@f0080000 {
+			compatible = "annapurna-labs,alpine-mc";
+			reg = <0x00 0xf0080000 0x00 0x10000>;
+		};
+
+		/* Thermal sensor */
+		thermal: thermal@fd860a00 {
+			compatible = "annapurna-labs,al-thermal";
+			reg = <0x00 0xfd860a00 0x00 0x100>;
+			#thermal-sensor-cells = <0>;
+		};
+
+		/* Watchdog (SP805) */
+		wdt0: watchdog@fd88c000 {
+			compatible = "arm,sp805", "arm,primecell";
+			reg = <0x00 0xfd88c000 0x00 0x1000>;
+			interrupts = <GIC_SPI 13 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		reboot: reboot {
+			compatible = "annapurna-labs,alpine-reboot";
+			wdt-parent = <&wdt0>;
+		};
+
+		/* GPIO controllers (PL061) */
+		gpio0: gpio@fd887000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd887000 0x00 0x1000>;
+			interrupts = <GIC_SPI 2 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio1: gpio@fd888000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd888000 0x00 0x1000>;
+			interrupts = <GIC_SPI 3 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio2: gpio@fd889000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd889000 0x00 0x1000>;
+			interrupts = <GIC_SPI 4 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio3: gpio@fd88a000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd88a000 0x00 0x1000>;
+			interrupts = <GIC_SPI 5 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio4: gpio@fd88b000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd88b000 0x00 0x1000>;
+			interrupts = <GIC_SPI 6 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		gpio5: gpio@fd897000 {
+			compatible = "arm,pl061", "arm,primecell";
+			reg = <0x00 0xfd897000 0x00 0x1000>;
+			interrupts = <GIC_SPI 7 IRQ_TYPE_LEVEL_HIGH>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		/* SGPO (Serial GPIO Output) — SATA activity LED */
+		sgpo: sgpo@fd8b4000 {
+			compatible = "annapurna-labs,alpine-sgpo";
+			reg = <0x00 0xfd8b4000 0x00 0x5000>;
+			gpio-controller;
+			#gpio-cells = <2>;
+		};
+
+		/*
+		 * I2C PLD bus (DesignWare)
+		 * Hosts: RTL8370MB switch (0x11), PCA9575 GPIO (0x28), PCA9546 mux (0x71)
+		 */
+		i2c_pld: i2c@fd880000 {
+			compatible = "snps,designware-i2c";
+			reg = <0x00 0xfd880000 0x00 0x1000>;
+			interrupts = <GIC_SPI 21 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-frequency = <100000>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			/* PCA9575 GPIO Expander — HDD power/LED */
+			gpio_exp: gpio@28 {
+				compatible = "nxp,pca9575";
+				reg = <0x28>;
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+
+			/* PCA9546 I2C Mux */
+			i2c_mux: i2c-mux@71 {
+				compatible = "nxp,pca9546";
+				reg = <0x71>;
+				#address-cells = <1>;
+				#size-cells = <0>;
+
+				/* Channel 0: RTC */
+				i2c@0 {
+					reg = <0>;
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					rtc@30 {
+						compatible = "sii,s35390a";
+						reg = <0x30>;
+					};
+				};
+
+				/* Channel 3: ADT7475 hardware monitor */
+				i2c@3 {
+					reg = <3>;
+					#address-cells = <1>;
+					#size-cells = <0>;
+
+					hwmon@2e {
+						compatible = "adi,adt7475";
+						reg = <0x2e>;
+					};
+				};
+			};
+		};
+
+		/* I2C general-purpose bus (disabled on UDM Pro) */
+		i2c_gen: i2c@fd894000 {
+			compatible = "snps,designware-i2c";
+			reg = <0x00 0xfd894000 0x00 0x1000>;
+			interrupts = <GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-frequency = <100000>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+			status = "disabled";
+		};
+
+		/* Pinctrl */
+		pinctrl: pinctrl@fd8a8000 {
+			compatible = "annapurna-labs,alpine-pinctrl";
+			reg = <0x00 0xfd8a8000 0x00 0x1000>;
+		};
+
+		/*
+		 * Ethernet ports (al_eth driver)
+		 *
+		 * Port 0: 10G SFP+ WAN (eth9) — direct to SoC
+		 * Port 1: 1GbE WAN RJ45 (eth8) — direct to SoC
+		 * Port 2: 10G SFP+ LAN (eth10) — direct to SoC
+		 * Port 3: 1GbE Switch uplink (switch0) — connected to RTL8370MB
+		 *
+		 * The switch creates eth0-eth7 as virtual sub-ports of switch0.
+		 * All 8 RJ45 LAN ports share the 1GbE uplink to the SoC.
+		 */
+		eth0: ethernet@fc000000 {
+			compatible = "annapurna-labs,al-eth";
+			reg = <0x00 0xfc000000 0x00 0x1000>;
+			interrupts = <GIC_SPI 61 IRQ_TYPE_LEVEL_HIGH>;
+			/* 10G SFP+ — WAN SFP+ (eth9 in stock firmware) */
+			port-id = <0>;
+			phy-mode = "10gbase-r";
+			serdes-grp = <0>;
+			serdes-lane = <0>;
+			auto-neg = "disabled";
+			status = "okay";
+		};
+
+		eth1: ethernet@fc100000 {
+			compatible = "annapurna-labs,al-eth";
+			reg = <0x00 0xfc100000 0x00 0x1000>;
+			interrupts = <GIC_SPI 62 IRQ_TYPE_LEVEL_HIGH>;
+			/* 1GbE — WAN RJ45 (eth8 in stock firmware) */
+			port-id = <1>;
+			phy-mode = "rgmii";
+			phy-addr = <4>;
+			mdio-freq-khz = <1000>;
+			auto-neg-mode = "out-of-band";
+			status = "okay";
+		};
+
+		eth2: ethernet@fc200000 {
+			compatible = "annapurna-labs,al-eth";
+			reg = <0x00 0xfc200000 0x00 0x1000>;
+			interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>;
+			/* 10G SFP+ — LAN SFP+ (eth10 in stock firmware) */
+			port-id = <2>;
+			phy-mode = "10gbase-r";
+			serdes-grp = <3>;
+			serdes-lane = <0>;
+			auto-neg = "disabled";
+			status = "okay";
+		};
+
+		eth3: ethernet@fc300000 {
+			compatible = "annapurna-labs,al-eth";
+			reg = <0x00 0xfc300000 0x00 0x1000>;
+			interrupts = <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH>;
+			/* 1GbE — RTL8370MB switch uplink (switch0 in stock firmware) */
+			port-id = <3>;
+			phy-mode = "rgmii";
+			status = "okay";
+		};
+
+		/*
+		 * External PCIe port 0 — xHCI USB (eMMC boot)
+		 * Uses patched pcie-al.c with pre-set dbi_base.
+		 */
+		pcie_ext0: pcie@fd800000 {
+			compatible = "amazon,al-alpine-v2-pcie";
+			device_type = "pci";
+			reg = <0x00 0xfd800000 0x00 0x10000>,
+			      <0x00 0xfb600000 0x00 0x100000>;
+			reg-names = "controller", "config";
+			dma-coherent;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			interrupt-parent = <&gic>;
+			interrupt-map-mask = <0x00 0x00 0x00 0x07>;
+			interrupt-map = <0x00 0x00 0x00 0x01
+					 &gic 0 41 IRQ_TYPE_LEVEL_HIGH>;
+			msi-parent = <&msix>;
+			ranges = <0x02000000 0x00 0xc0010000
+				  0x00 0xc0010000 0x00 0x7ff0000>,
+				 <0x01000000 0x00 0x00010000
+				  0x00 0xc0000000 0x00 0x10000>;
+			bus-range = <0x00 0xff>;
+			linux,pci-domain = <1>;
+			status = "okay";
+		};
+
+		/* External PCIe ports 1-3 — disabled on UDM Pro */
+		pcie_external1: pcie-external1 {
+			compatible = "pci-host-ecam-generic";
+			device_type = "pci";
+			reg = <0x00 0xfd820000 0x00 0x20000>;
+			dma-coherent;
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			interrupt-parent = <&gic>;
+			interrupt-map-mask = <0x00 0x00 0x00 0x07>;
+			interrupt-map = <0x00 0x00 0x00 0x01
+					 &gic 0 42 IRQ_TYPE_LEVEL_HIGH>;
+			msi-parent = <&msix>;
+			bus-range = <0x00 0xff>;
+			status = "disabled";
+		};
+
+		/* SPI flash controller */
+		spi: spi@fd882000 {
+			compatible = "amazon,alpine-dw-apb-ssi",
+				     "snps,dw-spi-mmio", "snps,dw-apb-ssi";
+			reg = <0x00 0xfd882000 0x00 0x1000>;
+			interrupts = <GIC_SPI 23 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "sbclk";
+			num-cs = <4>;
+			#address-cells = <1>;
+			#size-cells = <0>;
+
+			flash@0 {
+				compatible = "jedec,spi-nor";
+				reg = <0>;
+				spi-max-frequency = <37500000>;
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				partition@0 {
+					reg = <0x000000 0x1c0000>;
+					label = "u-boot";
+				};
+
+				partition@1c0000 {
+					reg = <0x1c0000 0x10000>;
+					label = "u-boot-env";
+				};
+
+				partition@1d0000 {
+					reg = <0x1d0000 0x10000>;
+					label = "u-boot-env-redundant";
+				};
+
+				partition@1e0000 {
+					reg = <0x1e0000 0x10000>;
+					label = "factory";
+					read-only;
+				};
+
+				partition@1f0000 {
+					reg = <0x1f0000 0x10000>;
+					label = "eeprom";
+					read-only;
+				};
+
+				partition@200000 {
+					reg = <0x200000 0x600000>;
+					label = "recovery";
+				};
+
+				partition@800000 {
+					reg = <0x800000 0xe00000>;
+					label = "config";
+				};
+			};
+		};
+	};
+
+	/* Thermal zone */
+	thermal-zones {
+		cpu-thermal {
+			polling-delay-passive = <250>;
+			polling-delay = <1000>;
+			thermal-sensors = <&thermal>;
+
+			trips {
+				cpu_crit: cpu-crit {
+					temperature = <105000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+		};
+	};
+
+	/* SATA activity LED — single HDD bay */
+	sata-leds {
+		compatible = "annapurna-labs,al-sata-sw-leds";
+
+		led@0 {
+			label = "sata:host0:port0";
+			pci_domain = <0>;
+			pci_bus = <0>;
+			pci_dev = <0x08>;
+			port = <0>;
+			gpios = <&sgpo 6 GPIO_ACTIVE_HIGH>;
+			slot-no = <1>;
+		};
+	};
+
+	/* HDD power control — single bay */
+	hdd-pwrctl {
+		compatible = "ui,hdd-pwrctl";
+
+		hdd@0 {
+			slot-no = <1>;
+			fault-led = <&gpio_exp 5 GPIO_ACTIVE_HIGH>;
+		};
+	};
+};
+
+/* SB clock — 500 MHz (same as UNVR) */
+&sbclk {
+	clock-frequency = <500000000>;
+};
+
+/* UART0: serial console */
+&uart0 {
+	status = "okay";
+};

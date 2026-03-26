@@ -28,7 +28,7 @@ This project provides everything needed to run a **modern Linux 6.12 LTS kernel*
 
 | Module | Description | Source |
 |--------|-------------|--------|
-| `al_eth` | 1GbE + 10GbE Ethernet driver | Ported from [delroth/al_eth-standalone](https://github.com/delroth/al_eth-standalone) (5.5 → 6.12) |
+| `al_eth` | 1GbE + 10GbE Ethernet driver with shared MDIO bus | Ported from [delroth/al_eth-standalone](https://github.com/delroth/al_eth-standalone) (5.5 → 6.12) |
 | `al_dma` | RAID5/6 hardware parity acceleration (XOR/PQ) | HAL from [delroth/alpine_hal](https://github.com/delroth/alpine_hal) |
 | `al_ssm` | Hardware AES-XTS/CBC crypto engine | HAL from alpine_hal |
 | `al_sgpo` | Serial GPIO Output controller for HDD bay LEDs | Reverse-engineered from firmware |
@@ -36,10 +36,12 @@ This project provides everything needed to run a **modern Linux 6.12 LTS kernel*
 ### Device Trees (`dts/`)
 
 - `alpine-v2-ubnt-unvr.dts` — Ubiquiti UNVR (4-bay NAS/NVR)
+- `alpine-v2-ubnt-udmpro.dts` — Ubiquiti UDM Pro (Gateway/Router)
 
 ### Configs (`configs/`)
 
-- `unvr_defconfig` — Minimal kernel config for UNVR
+- `unvr_defconfig` — Kernel config for UNVR (NAS focus: RAID, SATA, NFS, Samba)
+- `udmpro_defconfig` — Kernel config for UDM Pro (Gateway focus: nftables, WireGuard, QoS, bridging)
 - `Dockerfile` — Cross-compilation environment (Debian Bookworm, aarch64-linux-gnu)
 
 ## Key Discoveries
@@ -59,6 +61,22 @@ These findings are not documented anywhere else and were discovered through firm
 6. **`linux,pci-probe-only`** — Must be placed in the `/chosen` node (not the PCI controller node) and must be `= <1>` (u32 value, not boolean).
 
 7. **IOMMU Passthrough** — `iommu.passthrough=1` must be in the DTB bootargs, not U-Boot env, because U-Boot's `setenv bootargs` in the boot command overrides DTB values.
+
+8. **Shared MDIO Bus** — On Alpine V2, all Ethernet MACs share one physical MDIO bus. The stock firmware has a separate `alpine_mdio_shared` platform driver (out-of-tree). Our `al_eth` module implements shared MDIO internally: the first port with `phy_exist` registers the bus, subsequent ports reuse it.
+
+9. **AT803X PHY requires REGULATOR** — The UDM Pro uses an Atheros/QCA 8031 PHY (driver `at803x`). This driver has `depends on REGULATOR` in Kconfig. Without `CONFIG_REGULATOR=y`, the driver is silently not built even when `CONFIG_AT803X_PHY=y` is set. This is a common Kconfig pitfall.
+
+10. **EEPROM Identity (SPI-NOR Flash)** — Hardware identity (MAC, board ID, device ID, HW revision) is stored in the "eeprom" MTD partition (typically `/dev/mtd4ro`). The stock firmware reads this via `ubnthal.ko` at `/proc/ubnthal/board`. Without ubnthal, the EEPROM can be read directly. Layout:
+    ```
+    Offset  Size  Field
+    0x0000  6     Base MAC address
+    0x000C  2     Board ID (e.g. 0xEA15 = UDM Pro)
+    0x000E  2     Hardware revision
+    0x0010  4     Device ID (unique per unit)
+    0x8000  4     Magic "UBNT" (redundant copy)
+    ```
+
+11. **Platform Detection without ubnthal** — On custom kernels without `ubnthal.ko`, the platform can be detected via DeviceTree (`/sys/firmware/devicetree/base/compatible` contains `ubnt,udm-pro`) and the board ID via `/proc/cmdline` (`boardid=ea15`) or EEPROM MTD.
 
 ## Building
 
@@ -87,26 +105,31 @@ docker run --rm \
   '
 ```
 
+For UDM Pro, replace `unvr_defconfig` with `udmpro_defconfig`.
+
 ## Hardware Support Status
 
-| Feature | Status | Driver |
-|---------|--------|--------|
-| CPU (4x Cortex-A57) | ✅ | mainline |
-| Internal PCIe | ✅ | `pcie-al-internal` (new) |
-| External PCIe | ✅ | `pcie-al` (patched) |
-| Ethernet 1GbE | ✅ | `al_eth` (ported) |
-| Ethernet 10GbE SFP+ | ✅ | `al_eth` (ported) |
-| AHCI SATA | ✅ | mainline `ahci` |
-| RAID5/6 HW Parity | ✅ | `al_dma` (ported) |
-| HW AES Crypto | ✅ | `al_ssm` (ported) |
-| HDD Bay LEDs | ✅ | `al_sgpo` (new) |
-| Fan Control (ADT7475) | ✅ | mainline `adt7475` |
-| I2C GPIO Expanders | ✅ | mainline `pca953x` |
-| MSI-X Interrupts | ✅ | mainline `irq-alpine-msi` |
-| USB (xHCI) | ✅ | mainline `xhci-hcd` |
-| RTC (S35390A) | ✅ | mainline |
-| Watchdog (SP805) | ✅ | mainline |
-| SPI Flash (MTD) | ✅ | mainline |
+| Feature | UNVR | UDM Pro | Driver |
+|---------|------|---------|--------|
+| CPU (4x Cortex-A57) | ✅ | ✅ | mainline |
+| Internal PCIe | ✅ | ✅ | `pcie-al-internal` (new) |
+| External PCIe | ✅ | ✅ | `pcie-al` (patched) |
+| Ethernet 1GbE (RGMII) | ✅ | ✅ | `al_eth` + AT803X PHY |
+| Ethernet 10GbE SFP+ | ✅ | ✅ | `al_eth` (LM mode) |
+| Shared MDIO Bus | ✅ | ✅ | `al_eth` (built-in shared) |
+| AHCI SATA | ✅ | ✅ | mainline `ahci` |
+| RAID5/6 HW Parity | ✅ | ✅ | `al_dma` (ported) |
+| HW AES Crypto | ✅ | ✅ | `al_ssm` (ported) |
+| HDD Bay LEDs | ✅ | ✅ | `al_sgpo` (new) |
+| Fan Control (ADT7475) | ✅ | ✅ | mainline `adt7475` |
+| I2C GPIO Expanders | ✅ | ✅ | mainline `pca953x` |
+| MSI-X Interrupts | ✅ | ✅ | mainline `irq-alpine-msi` |
+| USB (xHCI) | ✅ | ✅ | mainline `xhci-hcd` |
+| RTC (S35390A) | ✅ | ✅ | mainline |
+| Watchdog (SP805) | ✅ | ✅ | mainline |
+| SPI Flash (MTD/EEPROM) | ✅ | ✅ | mainline |
+| LCM Display | — | ✅ | USB ACM (`ttyACM0`) |
+| RTL8370MB Switch | — | ⏳ | needs porting |
 
 ## Tested On
 
@@ -116,6 +139,41 @@ docker run --rm \
   - RAID5: 3x 3TB HDD, 57 MB/s write, 204 MB/s read
   - HW Crypto: AES-XTS priority 400 (beats ARM CE at 300)
   - Fans: 3x, PWM controllable, 2600-8600 RPM
+
+- **Ubiquiti UDM Pro** (Board ID `ea15`, 4GB RAM, 2x SFP+ / 2x 1GbE / RTL8370MB switch)
+  - Kernel: 6.12.77
+  - Rootfs: Alpine Linux 3.21
+  - PHY: Atheros QCA8031 (AT803X driver, needs `CONFIG_REGULATOR=y`)
+  - eMMC boot via USB xHCI (ASMedia)
+  - SPI-NOR EEPROM: factory identity readable from `/dev/mtd4ro`
+
+## Platform-Specific Notes
+
+### UDM Pro Kernel Config
+
+The UDM Pro defconfig requires these non-obvious settings:
+
+```
+CONFIG_REGULATOR=y                # Required dependency for AT803X PHY driver
+CONFIG_REGULATOR_FIXED_VOLTAGE=y  # Needed by regulator framework
+CONFIG_AT803X_PHY=y               # Atheros/QCA 8031 PHY (eth1 WAN RJ45)
+CONFIG_REALTEK_PHY=y              # RTL8370MB switch PHY (eth3 switch uplink)
+```
+
+Without `CONFIG_REGULATOR`, `CONFIG_AT803X_PHY=y` is silently ignored by Kconfig (`depends on REGULATOR`).
+
+### UDM Pro Network Ports
+
+| Port | Interface | Speed | PHY | Description |
+|------|-----------|-------|-----|-------------|
+| SFP+ WAN | eth0 | 10G | SFP LM | WAN SFP+ |
+| WAN RJ45 | eth1 | 1G | QCA8031 (addr 4) | WAN RJ45 |
+| SFP+ LAN | eth2 | 10G | SFP LM | LAN SFP+ |
+| Switch Uplink | eth3 | 1G | RTL8370MB (addr 17) | Uplink to 8-port switch |
+
+### Docker Export Caveat
+
+When building rootfs via `docker export`, the exported tar contains `/dev/console` as a regular file (not a character device). This prevents `devtmpfs` from mounting at boot, causing a kernel panic ("No working init found"). Fix: `rm -rf $ROOTFS/dev && mkdir -p $ROOTFS/dev` after extraction.
 
 ## License
 

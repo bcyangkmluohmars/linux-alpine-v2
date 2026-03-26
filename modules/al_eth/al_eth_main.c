@@ -82,13 +82,22 @@ MODULE_VERSION(DRV_MODULE_VERSION);
 #define TX_TIMEOUT  (30*HZ)
 
 /* Time in mSec to keep trying to read / write from MDIO in case of error */
-#define MDIO_TIMEOUT_MSEC	100
+#define MDIO_TIMEOUT_MSEC	5000
 
 /* Time in mSec to switch auto-FEC on init */
 #define AUTO_FEC_INITIAL_TIMEOUT	1000
 
 /* Time in mSec to switch auto-FEC on toggle */
 #define AUTO_FEC_TOGGLE_TIMEOUT		500
+
+/*
+ * Shared MDIO bus — on Alpine V2, all Ethernet ports share one physical
+ * MDIO bus. The first port with phy_exist registers the bus, others reuse it.
+ * This replaces the stock "alpine_mdio_shared" platform driver.
+ */
+static struct mii_bus *al_shared_mdio_bus;
+static struct al_eth_adapter *al_shared_mdio_adapter;
+static DEFINE_MUTEX(al_shared_mdio_lock);
 
 static int disable_msi;
 
@@ -2016,98 +2025,130 @@ static void al_eth_mdiobus_teardown(struct al_eth_adapter *adapter)
 	if (!adapter->mdio_bus)
 		return;
 
+	/* Don't free the shared MDIO bus — it persists across port up/down.
+	 * Only disconnect our PHY from it. */
+	if (adapter->mdio_bus == al_shared_mdio_bus) {
+		adapter->mdio_bus = NULL;
+		return;
+	}
+
 	mdiobus_unregister(adapter->mdio_bus);
 	mdiobus_free(adapter->mdio_bus);
 	phy_device_free(adapter->phydev);
 }
 
 /**
+ * al_eth_mdiobus_create_shared - register the shared MDIO bus
+ *
+ * On Alpine V2, all Ethernet MACs share one physical MDIO bus.
+ * The first port with phy_exist creates and registers it.
+ * This replaces the stock out-of-tree "alpine_mdio_shared" driver.
+ */
+static int al_eth_mdiobus_create_shared(struct al_eth_adapter *adapter)
+{
+	struct mii_bus *bus;
+	int i, rc;
+
+	bus = mdiobus_alloc();
+	if (!bus)
+		return -ENOMEM;
+
+	bus->name  = "alpine_mdio_shared";
+	snprintf(bus->id, MII_BUS_ID_SIZE, "alpine_mdio_shared_%x",
+		 adapter->pdev->bus->number);
+	bus->priv  = adapter;
+	bus->parent = &adapter->pdev->dev;
+	bus->read  = &al_mdio_read;
+	bus->write = &al_mdio_write;
+	bus->read_c45  = &al_mdio_read_c45;
+	bus->write_c45 = &al_mdio_write_c45;
+
+	for (i = 0; i < PHY_MAX_ADDR; i++)
+		bus->irq[i] = PHY_POLL;
+
+	/* Don't auto-probe — ports connect their own PHYs by address */
+	bus->phy_mask = 0xffffffff;
+
+	rc = mdiobus_register(bus);
+	if (rc) {
+		netdev_err(adapter->netdev, "shared mdiobus_register failed (%d)\n", rc);
+		mdiobus_free(bus);
+		return rc;
+	}
+
+	al_shared_mdio_bus = bus;
+	al_shared_mdio_adapter = adapter;
+	netdev_info(adapter->netdev, "registered shared MDIO bus %s\n", bus->id);
+	return 0;
+}
+
+/**
  * al_eth_mdiobus_setup - initialize mdiobus and register to kernel
  *
- *
+ * Uses a shared MDIO bus for all ports on the same PCI bus (Alpine V2
+ * internal PCIe). The first port with phy_exist creates the bus,
+ * subsequent ports reuse it and connect their PHY by address.
  **/
 static int al_eth_mdiobus_setup(struct al_eth_adapter *adapter)
 {
 	struct phy_device *phydev;
-	int i;
-	int ret;
+	int rc;
 
-	adapter->mdio_bus = mdiobus_alloc();
-	if (adapter->mdio_bus == NULL)
-		return -ENOMEM;
+	mutex_lock(&al_shared_mdio_lock);
 
-	adapter->mdio_bus->name      = "al mdio bus";
-	snprintf(adapter->mdio_bus->id, MII_BUS_ID_SIZE, "%x",
-		 (adapter->pdev->bus->number << 8) | adapter->pdev->devfn);
-	adapter->mdio_bus->priv      = adapter;
-	adapter->mdio_bus->parent    = &adapter->pdev->dev;
-	adapter->mdio_bus->read      = &al_mdio_read;
-	adapter->mdio_bus->write     = &al_mdio_write;
-	adapter->mdio_bus->read_c45  = &al_mdio_read_c45;
-	adapter->mdio_bus->write_c45 = &al_mdio_write_c45;
-
-	/* Initialise the interrupts to polling */
-	for (i = 0; i < PHY_MAX_ADDR; i++)
-		adapter->mdio_bus->irq[i] = PHY_POLL;
-
-	if (adapter->phy_if == AL_ETH_BOARD_PHY_IF_XMDIO) {
-#if defined(CONFIG_ARCH_ALPINE)
-		/** XMDIO is not supported on host driver due to kernel 3.2 compatability issue */
-
-		/**
-		 * Mask out all the devices from auto probing
-		 * (we get device address from board params)
-		 */
-		adapter->mdio_bus->phy_mask = 0xffffffff;
-		i = mdiobus_register(adapter->mdio_bus);
-		if (i) {
-			netdev_warn(adapter->netdev, "mdiobus_reg failed (0x%x)\n", i);
-			mdiobus_free(adapter->mdio_bus);
-			return i;
+	/* Create shared bus if it doesn't exist yet */
+	if (!al_shared_mdio_bus) {
+		rc = al_eth_mdiobus_create_shared(adapter);
+		if (rc) {
+			mutex_unlock(&al_shared_mdio_lock);
+			return rc;
 		}
-
-		phydev = get_phy_device(adapter->mdio_bus, adapter->phy_addr, true);
-		if (!phydev) {
-			netdev_err(adapter->netdev, "%s: phy device get failed\n", __func__);
-			goto error;
-		}
-
-		ret = phy_device_register(phydev);
-		if (ret) {
-			netdev_err(adapter->netdev, "%s: phy device register failed\n", __func__);
-			goto error_xmdio_phy;
-		}
-#else
-		ret = -EOPNOTSUPP;
-		return ret;
-#endif
-	} else {
-		adapter->mdio_bus->phy_mask = ~(1 << adapter->phy_addr);
-		i = mdiobus_register(adapter->mdio_bus);
-		if (i) {
-			netdev_warn(adapter->netdev, "mdiobus_reg failed (0x%x)\n", i);
-			mdiobus_free(adapter->mdio_bus);
-			return i;
-		}
-		phydev = phy_find_first(adapter->mdio_bus);
 	}
 
-	if (!phydev || !phydev->drv) {
-		netdev_err(adapter->netdev, "%s: phy device get failed\n", __func__);
-		goto error;
+	adapter->mdio_bus = al_shared_mdio_bus;
+	mutex_unlock(&al_shared_mdio_lock);
+
+	/* Check if PHY is already registered on the shared bus (port up/down cycle) */
+	phydev = mdiobus_get_phy(adapter->mdio_bus, adapter->phy_addr);
+	if (phydev) {
+		netdev_info(adapter->netdev,
+			    "PHY at addr %d already on bus: %s\n",
+			    adapter->phy_addr,
+			    phydev->drv ? phydev->drv->name : "generic");
+		return 0;
+	}
+
+	/* Connect to our PHY at the configured address */
+	phydev = get_phy_device(adapter->mdio_bus, adapter->phy_addr, false);
+	if (IS_ERR_OR_NULL(phydev)) {
+		netdev_warn(adapter->netdev,
+			    "PHY not found at addr %d (will retry on link)\n",
+			    adapter->phy_addr);
+		/* Not fatal — PHY might appear later (e.g. switch PHY) */
+		adapter->mdio_bus = NULL;
+		return 0;
+	}
+
+	rc = phy_device_register(phydev);
+	if (rc && rc != -EEXIST) {
+		netdev_err(adapter->netdev, "phy_device_register failed (%d)\n", rc);
+		phy_device_free(phydev);
+		adapter->mdio_bus = NULL;
+		return 0;
+	}
+
+	if (!phydev->drv) {
+		netdev_warn(adapter->netdev,
+			    "PHY at addr %d (id 0x%08x) has no driver\n",
+			    adapter->phy_addr, phydev->phy_id);
+	} else {
+		netdev_info(adapter->netdev,
+			    "PHY at addr %d: %s (id 0x%08x)\n",
+			    adapter->phy_addr,
+			    phydev->drv->name, phydev->phy_id);
 	}
 
 	return 0;
-
-#if defined(CONFIG_ARCH_ALPINE)
-error_xmdio_phy:
-	phy_device_free(phydev);
-#endif
-error:
-	netdev_warn(adapter->netdev, "No PHY devices\n");
-	mdiobus_unregister(adapter->mdio_bus);
-	mdiobus_free(adapter->mdio_bus);
-	return -ENODEV;
 }
 
 static void al_eth_adjust_link(struct net_device *dev)

@@ -18,6 +18,17 @@ env:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        target:
+          - name: unvr
+            defconfig: unvr_defconfig
+            dts: alpine-v2-ubnt-unvr
+            description: "Ubiquiti UNVR (NAS)"
+          - name: udmpro
+            defconfig: udmpro_defconfig
+            dts: alpine-v2-ubnt-udmpro
+            description: "Ubiquiti UDM Pro (Gateway)"
     outputs:
       kernel_version: ${{ steps.resolve.outputs.kernel_version }}
     steps:
@@ -60,28 +71,33 @@ jobs:
           KDIR="linux-${KERNEL_VERSION}"
 
           # --- Defconfig ---
-          cp configs/unvr_defconfig "${KDIR}/arch/arm64/configs/unvr_defconfig"
+          cp configs/${{ matrix.target.defconfig }} "${KDIR}/arch/arm64/configs/${{ matrix.target.defconfig }}"
 
-          # --- Device tree source ---
+          # --- Device tree sources (copy all) ---
           cp dts/*.dts "${KDIR}/arch/arm64/boot/dts/amazon/"
-          echo 'dtb-$(CONFIG_ARCH_ALPINE) += alpine-v2-ubnt-unvr.dtb' \
-            >> "${KDIR}/arch/arm64/boot/dts/amazon/Makefile"
+          # Register all DTS files in the Makefile
+          for dts in dts/*.dts; do
+            base="$(basename "$dts" .dts)"
+            if ! grep -q "${base}.dtb" "${KDIR}/arch/arm64/boot/dts/amazon/Makefile"; then
+              echo "dtb-\$(CONFIG_ARCH_ALPINE) += ${base}.dtb" \
+                >> "${KDIR}/arch/arm64/boot/dts/amazon/Makefile"
+            fi
+          done
 
           # --- PCIe patches ---
-          # Replace mainline pcie-al.c with DBI-offset-fixed version
           cp patches/pcie-al-dbi-fix.c \
             "${KDIR}/drivers/pci/controller/dwc/pcie-al.c"
 
-          # Add internal PCIe host controller driver (new file)
           cp patches/pcie-al-internal.c \
             "${KDIR}/drivers/pci/controller/pcie-al-internal.c"
 
-          # Add build rule for pcie-al-internal
-          echo 'obj-$(CONFIG_PCIE_AL_INTERNAL)		+= pcie-al-internal.o' \
-            >> "${KDIR}/drivers/pci/controller/Makefile"
+          if ! grep -q 'PCIE_AL_INTERNAL' "${KDIR}/drivers/pci/controller/Makefile"; then
+            echo 'obj-$(CONFIG_PCIE_AL_INTERNAL)		+= pcie-al-internal.o' \
+              >> "${KDIR}/drivers/pci/controller/Makefile"
+          fi
 
-          # Add PCIE_AL_INTERNAL Kconfig entry (insert before last endmenu)
-          python3 -c "
+          if ! grep -q 'PCIE_AL_INTERNAL' "${KDIR}/drivers/pci/controller/Kconfig"; then
+            python3 -c "
           entry = '\nconfig PCIE_AL_INTERNAL\n'
           entry += '\tbool \"Annapurna Labs Alpine V2 internal PCIe host controller\"\n'
           entry += '\tdepends on ARM64\n'
@@ -99,12 +115,16 @@ jobs:
           with open(path, 'w') as f:
               f.write(content)
           "
+          fi
 
-      - name: Build kernel
+      - name: Build kernel (${{ matrix.target.name }})
         run: |
           make -C "linux-${KERNEL_VERSION}" \
             ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            unvr_defconfig
+            mrproper
+          make -C "linux-${KERNEL_VERSION}" \
+            ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            ${{ matrix.target.defconfig }}
           make -C "linux-${KERNEL_VERSION}" \
             ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             -j"$(nproc)" Image dtbs modules
@@ -113,7 +133,7 @@ jobs:
         run: |
           mkimage -A arm64 -O linux -T kernel -C none \
             -a 0x00080000 -e 0x00080000 \
-            -n "Linux ${KERNEL_VERSION} Alpine V2" \
+            -n "Linux ${KERNEL_VERSION} Alpine V2 (${{ matrix.target.name }})" \
             -d "linux-${KERNEL_VERSION}/arch/arm64/boot/Image" \
             "linux-${KERNEL_VERSION}/uImage"
 
@@ -121,11 +141,13 @@ jobs:
         run: |
           KDIR="$(pwd)/linux-${KERNEL_VERSION}"
           for mod in al_eth al_dma al_ssm al_sgpo; do
-            MDIR="/tmp/build-${mod}"
-            cp -a "modules/${mod}" "${MDIR}"
-            make -C "${KDIR}" \
-              ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-              W=0 M="${MDIR}" modules
+            if [ -d "modules/${mod}" ]; then
+              MDIR="/tmp/build-${mod}"
+              cp -a "modules/${mod}" "${MDIR}"
+              make -C "${KDIR}" \
+                ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+                W=0 M="${MDIR}" modules
+            fi
           done
 
       - name: Collect release artifacts
@@ -135,33 +157,33 @@ jobs:
           REF="${GITHUB_REF_NAME}"
           [[ "${REF}" == v* ]] || REF="dev-$(git rev-parse --short HEAD)"
 
-          OUTDIR="linux-alpine-v2-${REF}"
+          OUTDIR="linux-alpine-v2-${{ matrix.target.name }}-${REF}"
           mkdir -p "${OUTDIR}"
 
           # --- Boot files ---
           cp "${KDIR}/uImage" "${OUTDIR}/"
           cp "${KDIR}/arch/arm64/boot/Image" "${OUTDIR}/"
-          cp "${KDIR}/arch/arm64/boot/dts/amazon/"*.dtb "${OUTDIR}/"
+          cp "${KDIR}/arch/arm64/boot/dts/amazon/${{ matrix.target.dts }}.dtb" "${OUTDIR}/"
 
-          # --- In-tree modules (stripped, standard lib/modules layout) ---
+          # --- In-tree modules ---
           make -C "${KDIR}" \
             ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             INSTALL_MOD_PATH="$(pwd)/${OUTDIR}" \
             INSTALL_MOD_STRIP=1 \
             modules_install
 
-          # --- Out-of-tree modules → lib/modules/<ver>/extra/ ---
+          # --- Out-of-tree modules ---
           MODDIR="${OUTDIR}/lib/modules/${KERNEL_VERSION}/extra"
           mkdir -p "${MODDIR}"
           for mod in al_eth al_dma al_ssm al_sgpo; do
-            find "/tmp/build-${mod}" -name '*.ko' -exec cp {} "${MODDIR}/" \;
+            find "/tmp/build-${mod}" -name '*.ko' -exec cp {} "${MODDIR}/" \; 2>/dev/null || true
           done
-          aarch64-linux-gnu-strip --strip-unneeded "${MODDIR}"/*.ko
+          aarch64-linux-gnu-strip --strip-unneeded "${MODDIR}"/*.ko 2>/dev/null || true
 
-          # --- Regenerate module dependencies ---
+          # --- Module dependencies ---
           depmod -b "$(pwd)/${OUTDIR}" "${KERNEL_VERSION}"
 
-          # --- Remove build/source symlinks (point nowhere outside the tree) ---
+          # --- Cleanup symlinks ---
           rm -f "${OUTDIR}/lib/modules/${KERNEL_VERSION}/build"
           rm -f "${OUTDIR}/lib/modules/${KERNEL_VERSION}/source"
 
@@ -175,11 +197,12 @@ jobs:
           # --- Tarball ---
           tar czf "${OUTDIR}.tar.gz" "${OUTDIR}"
           echo "ARTIFACT=${OUTDIR}.tar.gz" >> "$GITHUB_ENV"
+          echo "ARTIFACT_NAME=linux-alpine-v2-${{ matrix.target.name }}" >> "$GITHUB_ENV"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: linux-alpine-v2
+          name: ${{ env.ARTIFACT_NAME }}
           path: ${{ env.ARTIFACT }}
           compression-level: 0
 
@@ -190,50 +213,55 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Download artifact
+      - name: Download all artifacts
         uses: actions/download-artifact@v4
-        with:
-          name: linux-alpine-v2
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: linux-alpine-v2-*.tar.gz
+          files: |
+            linux-alpine-v2-unvr/linux-alpine-v2-unvr-*.tar.gz
+            linux-alpine-v2-udmpro/linux-alpine-v2-udmpro-*.tar.gz
           generate_release_notes: true
           body: |
             ## Linux ${{ needs.build.outputs.kernel_version }} for Alpine V2
 
-            Pre-built kernel and modules for Annapurna Labs Alpine V2 (AL-314) SoC.
-            All Alpine V2 devices use U-Boot — flash `uImage` + DTB to your kernel partition.
+            Pre-built kernels and modules for Annapurna Labs Alpine V2 (AL-314) SoC.
+            Both targets use U-Boot — flash `uImage` + DTB to the kernel partition.
 
-            ### Contents
+            ### Targets
+
+            | Target | Tarball | Device | Use Case |
+            |--------|---------|--------|----------|
+            | **unvr** | `linux-alpine-v2-unvr-*.tar.gz` | Ubiquiti UNVR | secfirstNAS |
+            | **udmpro** | `linux-alpine-v2-udmpro-*.tar.gz` | Ubiquiti UDM Pro | secfirstGW |
+
+            ### Contents (per target)
 
             | File | Description |
             |------|-------------|
             | `uImage` | U-Boot kernel image (bootm) |
             | `Image` | Raw ARM64 kernel binary (booti) |
-            | `alpine-v2-ubnt-unvr.dtb` | Device tree blob (Ubiquiti UNVR) |
-            | `lib/modules/*/extra/al_eth.ko` | 1GbE + 10GbE Ethernet |
+            | `*.dtb` | Device tree blob |
+            | `lib/modules/*/extra/al_eth.ko` | 1GbE + 10GbE Ethernet (+ RTL8370 switch on UDM Pro) |
             | `lib/modules/*/extra/al_dma.ko` | RAID5/6 HW parity (XOR/PQ) |
-            | `lib/modules/*/extra/al_ssm.ko` | HW AES-XTS/CBC crypto |
-            | `lib/modules/*/extra/al_sgpo.ko` | Serial GPIO (HDD LEDs) |
+            | `lib/modules/*/extra/al_ssm.ko` | HW AES-XTS/CBC crypto acceleration |
+            | `lib/modules/*/extra/al_sgpo.ko` | Serial GPIO (HDD/SATA LEDs) |
             | `lib/modules/*/kernel/` | In-tree kernel modules |
-            | `System.map` | Kernel symbol map |
-            | `SHA256SUMS` | File checksums |
+
+            ### UDM Pro extras (vs UNVR)
+            - WireGuard VPN kernel module
+            - Full nftables/netfilter stack (gateway firewall)
+            - Bridge + 802.1Q VLAN filtering
+            - Traffic shaping (HTB, SFQ, TBF, ingress)
+            - USB ACM (LCM front panel display)
+            - IPv6 NAT + masquerade
 
             ### Quick Start
 
             ```bash
-            tar xzf linux-alpine-v2-*.tar.gz
-            # Copy to device
-            scp uImage alpine-v2-ubnt-unvr.dtb root@<device>:/boot/
+            tar xzf linux-alpine-v2-<target>-*.tar.gz
+            scp uImage *.dtb root@<device>:/boot/
             scp -r lib/modules/* root@<device>:/lib/modules/
-            # On the device
-            depmod -a && reboot
+            ssh root@<device> "depmod -a && reboot"
             ```
-
-            ### Supported Hardware
-
-            - Ubiquiti UNVR / UNAS / UDM-Pro
-            - QNAP TS-x32x series
-            - MikroTik RB1100AHx4

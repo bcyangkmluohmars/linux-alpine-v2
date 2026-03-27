@@ -319,6 +319,13 @@ CONFIG_MARVELL_PHY=m
 CONFIG_MARVELL_10G_PHY=m
 CONFIG_REALTEK_PHY=y
 
+# DSA (Distributed Switch Architecture) for RTL8370MB managed switch
+CONFIG_NET_DSA=y
+CONFIG_NET_DSA_REALTEK=y
+CONFIG_NET_DSA_REALTEK_MDIO=y
+CONFIG_NET_DSA_REALTEK_SMI=y
+CONFIG_NET_DSA_REALTEK_RTL8365MB=y
+
 # No wireless on gateway (no built-in AP on UDM Pro)
 # CONFIG_WLAN is not set
 # CONFIG_BT is not set

@@ -228,12 +228,24 @@
 			#address-cells = <1>;
 			#size-cells = <0>;
 
-			/* PCA9575 GPIO Expander — HDD power/LED */
+			/* PCA9575 GPIO Expander — HDD power/LED/Switch */
 			gpio_exp: gpio@28 {
 				compatible = "nxp,pca9575";
 				reg = <0x28>;
 				gpio-controller;
 				#gpio-cells = <2>;
+
+				pin4-hog {
+					gpio-hog;
+					gpios = <4 0>;
+					output-high;
+				};
+
+				pin8-hog {
+					gpio-hog;
+					gpios = <8 0>;
+					output-high;
+				};
 			};
 
 			/* PCA9546 I2C Mux */
@@ -491,6 +503,31 @@
 		hdd@0 {
 			slot-no = <1>;
 			fault-led = <&gpio_exp 5 GPIO_ACTIVE_HIGH>;
+		};
+	};
+
+	/* RTL8370MB 8-port GbE managed switch
+	 * Connected to eth3 (MAC3) via RGMII.
+	 * MDIO address 0x11 on the shared alpine MDIO bus.
+	 */
+	switch-chip {
+		rtl8370mb@11 {
+			compatible = "realtek,rtl8370mb";
+			reg = <0x11>;
+			led-profile = <1>;
+
+			gmac {
+				cpu_port@0 {
+					reg = <0>;
+					mode = "disabled";
+				};
+
+				cpu_port@1 {
+					reg = <1>;
+					mode = "rgmii";
+					nway_enable;
+				};
+			};
 		};
 	};
 };

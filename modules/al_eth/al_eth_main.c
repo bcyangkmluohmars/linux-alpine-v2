@@ -63,6 +63,7 @@
 #include "al_eth_sysfs.h"
 #include "al_hal_unit_adapter_regs.h"
 #include "al_hal_eth_ec_regs.h"
+#include "al_hal_eth_mac_regs.h"
 
 #define DRV_MODULE_NAME	 "al_eth"
 #ifndef DRV_MODULE_VERSION
@@ -95,7 +96,8 @@ MODULE_VERSION(DRV_MODULE_VERSION);
  * MDIO bus. The first port with phy_exist registers the bus, others reuse it.
  * This replaces the stock "alpine_mdio_shared" platform driver.
  */
-static struct mii_bus *al_shared_mdio_bus;
+struct mii_bus *alpine_shared_mdio_bus;
+EXPORT_SYMBOL(alpine_shared_mdio_bus);
 static struct al_eth_adapter *al_shared_mdio_adapter;
 static DEFINE_MUTEX(al_shared_mdio_lock);
 
@@ -683,11 +685,22 @@ static int al_eth_board_params_init(struct al_eth_adapter *adapter)
 
 		switch (params.media_type) {
 		case AL_ETH_BOARD_MEDIA_TYPE_RGMII:
-			if (params.sfp_plus_module_exist == AL_TRUE)
+			if (params.sfp_plus_module_exist == AL_TRUE) {
 				/* Backward compatibility */
 				adapter->mac_mode = AL_ETH_MAC_MODE_SGMII;
-			else
+			} else if (params.phy_mdio_addr == 0x11) {
+				/* UDM Pro port 3 (switch uplink): RGMII, no standard PHY.
+				 * Set phy_exist=false so al_eth_up calls link_config
+				 * directly instead of waiting for a PHY driver.
+				 * Stock kernel has a PHY driver for this; we don't.
+				 */
 				adapter->mac_mode = AL_ETH_MAC_MODE_RGMII;
+				adapter->phy_exist = false;
+				adapter->link_config.active_speed = 1000;
+				adapter->link_config.active_duplex = 1;
+			} else {
+				adapter->mac_mode = AL_ETH_MAC_MODE_RGMII;
+			}
 
 			adapter->use_lm = false;
 			break;
@@ -824,7 +837,8 @@ al_eth_flow_ctrl_disable(struct al_eth_adapter *adapter)
 #ifdef CONFIG_PHYLIB
 static uint8_t al_eth_flow_ctrl_mutual_cap_get(struct al_eth_adapter *adapter)
 {
-	struct phy_device *phydev = phy_find_first(adapter->mdio_bus);
+	struct phy_device *phydev;
+
 	struct al_eth_link_config *link_config = &adapter->link_config;
 	uint8_t peer_flow_ctrl = AL_ETH_FLOW_CTRL_AUTONEG;
 	uint8_t new_flow_ctrl = AL_ETH_FLOW_CTRL_AUTONEG;
@@ -2027,7 +2041,7 @@ static void al_eth_mdiobus_teardown(struct al_eth_adapter *adapter)
 
 	/* Don't free the shared MDIO bus — it persists across port up/down.
 	 * Only disconnect our PHY from it. */
-	if (adapter->mdio_bus == al_shared_mdio_bus) {
+	if (adapter->mdio_bus == alpine_shared_mdio_bus) {
 		adapter->mdio_bus = NULL;
 		return;
 	}
@@ -2076,7 +2090,7 @@ static int al_eth_mdiobus_create_shared(struct al_eth_adapter *adapter)
 		return rc;
 	}
 
-	al_shared_mdio_bus = bus;
+	alpine_shared_mdio_bus = bus;
 	al_shared_mdio_adapter = adapter;
 	netdev_info(adapter->netdev, "registered shared MDIO bus %s\n", bus->id);
 	return 0;
@@ -2097,7 +2111,7 @@ static int al_eth_mdiobus_setup(struct al_eth_adapter *adapter)
 	mutex_lock(&al_shared_mdio_lock);
 
 	/* Create shared bus if it doesn't exist yet */
-	if (!al_shared_mdio_bus) {
+	if (!alpine_shared_mdio_bus) {
 		rc = al_eth_mdiobus_create_shared(adapter);
 		if (rc) {
 			mutex_unlock(&al_shared_mdio_lock);
@@ -2105,7 +2119,7 @@ static int al_eth_mdiobus_setup(struct al_eth_adapter *adapter)
 		}
 	}
 
-	adapter->mdio_bus = al_shared_mdio_bus;
+	adapter->mdio_bus = alpine_shared_mdio_bus;
 	mutex_unlock(&al_shared_mdio_lock);
 
 	/* Check if PHY is already registered on the shared bus (port up/down cycle) */
@@ -2122,9 +2136,19 @@ static int al_eth_mdiobus_setup(struct al_eth_adapter *adapter)
 	phydev = get_phy_device(adapter->mdio_bus, adapter->phy_addr, false);
 	if (IS_ERR_OR_NULL(phydev)) {
 		netdev_warn(adapter->netdev,
-			    "PHY not found at addr %d (will retry on link)\n",
+			    "no standard PHY at addr %d — may be a switch\n",
 			    adapter->phy_addr);
 		/* Not fatal — PHY might appear later (e.g. switch PHY) */
+		adapter->mdio_bus = NULL;
+		return 0;
+	}
+
+	/* Reject bogus PHY IDs (MDIO timeout returns 0x0000 or 0xFFFF) */
+	if (phydev->phy_id == 0x00000000 || phydev->phy_id == 0xFFFFFFFF) {
+		netdev_info(adapter->netdev,
+			    "invalid PHY ID 0x%08x at addr %d — not a standard PHY\n",
+			    phydev->phy_id, adapter->phy_addr);
+		phy_device_free(phydev);
 		adapter->mdio_bus = NULL;
 		return 0;
 	}
@@ -2253,12 +2277,22 @@ static void al_eth_adjust_link(struct net_device *dev)
 
 static int al_eth_phy_init(struct al_eth_adapter *adapter)
 {
-	struct phy_device *phydev = phy_find_first(adapter->mdio_bus);
+	struct phy_device *phydev;
+
 	__ETHTOOL_DECLARE_LINK_MODE_MASK(mask) = { 0, };
 
 	adapter->link_config.old_link = 0;
 	adapter->link_config.active_duplex = DUPLEX_UNKNOWN;
 	adapter->link_config.active_speed = SPEED_UNKNOWN;
+
+	/* Find OUR PHY by address on the shared bus */
+	phydev = mdiobus_get_phy(adapter->mdio_bus, adapter->phy_addr);
+	if (!phydev) {
+		netdev_info(adapter->netdev,
+			    "no PHY at addr %d, skipping phy_init\n",
+			    adapter->phy_addr);
+		return 0;
+	}
 
 	/* Attach the MAC to the PHY. */
 	phydev = phy_connect(adapter->netdev, dev_name(&phydev->mdio.dev), al_eth_adjust_link,

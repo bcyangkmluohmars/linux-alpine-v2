@@ -32,6 +32,7 @@ This project provides everything needed to run a **modern Linux 6.12 LTS kernel*
 | `al_dma` | RAID5/6 hardware parity acceleration (XOR/PQ) | HAL from [delroth/alpine_hal](https://github.com/delroth/alpine_hal) |
 | `al_ssm` | Hardware AES-XTS/CBC crypto engine | HAL from alpine_hal |
 | `al_sgpo` | Serial GPIO Output controller for HDD bay LEDs | Reverse-engineered from firmware |
+| `rtl8370mb` | RTL8370MB 8-port GbE switch init (SMI-over-MDIO) | Reverse-engineered from stock UDM Pro firmware |
 
 ### Device Trees (`dts/`)
 
@@ -78,6 +79,10 @@ These findings are not documented anywhere else and were discovered through firm
 
 11. **Platform Detection without ubnthal** — On custom kernels without `ubnthal.ko`, the platform can be detected via DeviceTree (`/sys/firmware/devicetree/base/compatible` contains `ubnt,udm-pro`) and the board ID via `/proc/cmdline` (`boardid=ea15`) or EEPROM MTD.
 
+12. **RTL8370MB Switch (UDM Pro)** — The 8-port GbE switch uses SMI-over-MDIO at **PHY address 0x1D (29)**, not at the DTS `reg = <0x11>` (which is an internal device ID). SMI management goes through **eth8's MDIO bus** (PCI 00:01.0), not eth0's. The switch requires PCA9575 GPIO pins 4+8 driven HIGH to release from hardware reset. See `docs/RTL8370MB.md` for full details.
+
+13. **Switch Uplink phy_exist Override** — Board params for port 3 (switch uplink) say `phy_exist=Yes, phy_addr=17`, but the RTL8370MB doesn't respond to standard PHY reads. Setting `phy_exist=false` in the al_eth driver makes `al_eth_up` call `al_eth_mac_link_config` directly (fixed 1000M/FD). Without this, the RGMII MAC never gets speed/duplex configured and RX silently receives 0 bytes.
+
 ## Building
 
 ```bash
@@ -97,11 +102,14 @@ docker run --rm \
     cd /build/linux
     make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- unvr_defconfig
     make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- -j$(nproc) Image dtbs modules
-    # Build out-of-tree modules
+    # Build out-of-tree modules (rtl8370mb depends on al_eth symbols)
     for mod in al_eth al_dma al_ssm al_sgpo; do
       cp -a /src/modules/$mod /build/$mod
       make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- W=0 M=/build/$mod modules
     done
+    cp -a /src/modules/rtl8370mb /build/rtl8370mb
+    make ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- W=0 M=/build/rtl8370mb \
+      KBUILD_EXTRA_SYMBOLS=/build/al_eth/Module.symvers modules
   '
 ```
 
@@ -117,6 +125,7 @@ For UDM Pro, replace `unvr_defconfig` with `udmpro_defconfig`.
 | Ethernet 1GbE (RGMII) | ✅ | ✅ | `al_eth` + AT803X PHY |
 | Ethernet 10GbE SFP+ | ✅ | ✅ | `al_eth` (LM mode) |
 | Shared MDIO Bus | ✅ | ✅ | `al_eth` (built-in shared) |
+| RTL8370MB 8-Port Switch | — | ✅ | `rtl8370mb` (new) |
 | AHCI SATA | ✅ | ✅ | mainline `ahci` |
 | RAID5/6 HW Parity | ✅ | ✅ | `al_dma` (ported) |
 | HW AES Crypto | ✅ | ✅ | `al_ssm` (ported) |
@@ -129,7 +138,6 @@ For UDM Pro, replace `unvr_defconfig` with `udmpro_defconfig`.
 | Watchdog (SP805) | ✅ | ✅ | mainline |
 | SPI Flash (MTD/EEPROM) | ✅ | ✅ | mainline |
 | LCM Display | — | ✅ | USB ACM (`ttyACM0`) |
-| RTL8370MB Switch | — | ⏳ | needs porting |
 
 ## Tested On
 
@@ -143,9 +151,21 @@ For UDM Pro, replace `unvr_defconfig` with `udmpro_defconfig`.
 - **Ubiquiti UDM Pro** (Board ID `ea15`, 4GB RAM, 2x SFP+ / 2x 1GbE / RTL8370MB switch)
   - Kernel: 6.12.77
   - Rootfs: Alpine Linux 3.21
+  - Switch: RTL8370MB fully operational (8x GbE LAN, 0.15ms RTT)
   - PHY: Atheros QCA8031 (AT803X driver, needs `CONFIG_REGULATOR=y`)
   - eMMC boot via USB xHCI (ASMedia)
-  - SPI-NOR EEPROM: factory identity readable from `/dev/mtd4ro`
+
+## UDM Pro Network Ports
+
+Stock firmware names (after interface renaming):
+
+| Port | Interface | PCI Device | Speed | PHY/Switch | Description |
+|------|-----------|------------|-------|------------|-------------|
+| SFP+ WAN | eth9 | 00:00.0 | 10G | SFP LM | WAN SFP+ |
+| WAN RJ45 | eth8 | 00:01.0 | 1G | QCA8031 (MDIO addr 4) | WAN RJ45 |
+| SFP+ LAN | eth10 | 00:02.0 | 10G | SFP LM | LAN SFP+ |
+| Switch Uplink | eth0 | 00:03.0 | 1G RGMII | RTL8370MB (SMI addr 0x1D) | 8-port LAN switch |
+| LAN Ports 1-8 | (via eth0) | — | 1G | RTL8370MB internal PHY | RJ45 LAN |
 
 ## Platform-Specific Notes
 
@@ -156,20 +176,11 @@ The UDM Pro defconfig requires these non-obvious settings:
 ```
 CONFIG_REGULATOR=y                # Required dependency for AT803X PHY driver
 CONFIG_REGULATOR_FIXED_VOLTAGE=y  # Needed by regulator framework
-CONFIG_AT803X_PHY=y               # Atheros/QCA 8031 PHY (eth1 WAN RJ45)
-CONFIG_REALTEK_PHY=y              # RTL8370MB switch PHY (eth3 switch uplink)
+CONFIG_AT803X_PHY=y               # Atheros/QCA 8031 PHY (eth8 WAN RJ45)
+CONFIG_REALTEK_PHY=y              # RTL8370MB switch PHY
 ```
 
 Without `CONFIG_REGULATOR`, `CONFIG_AT803X_PHY=y` is silently ignored by Kconfig (`depends on REGULATOR`).
-
-### UDM Pro Network Ports
-
-| Port | Interface | Speed | PHY | Description |
-|------|-----------|-------|-----|-------------|
-| SFP+ WAN | eth0 | 10G | SFP LM | WAN SFP+ |
-| WAN RJ45 | eth1 | 1G | QCA8031 (addr 4) | WAN RJ45 |
-| SFP+ LAN | eth2 | 10G | SFP LM | LAN SFP+ |
-| Switch Uplink | eth3 | 1G | RTL8370MB (addr 17) | Uplink to 8-port switch |
 
 ### Docker Export Caveat
 

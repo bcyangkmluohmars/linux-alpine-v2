@@ -140,13 +140,17 @@ jobs:
       - name: Build out-of-tree modules
         run: |
           KDIR="$(pwd)/linux-${KERNEL_VERSION}"
-          for mod in al_eth al_dma al_ssm al_sgpo; do
+          for mod in al_eth al_dma al_ssm al_sgpo rtl8370mb; do
             if [ -d "modules/${mod}" ]; then
               MDIR="/tmp/build-${mod}"
               cp -a "modules/${mod}" "${MDIR}"
+              EXTRA=""
+              if [ "${mod}" = "rtl8370mb" ] && [ -f /tmp/build-al_eth/Module.symvers ]; then
+                EXTRA="KBUILD_EXTRA_SYMBOLS=/tmp/build-al_eth/Module.symvers"
+              fi
               make -C "${KDIR}" \
                 ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-                W=0 M="${MDIR}" modules
+                W=0 M="${MDIR}" ${EXTRA} modules
             fi
           done
 
@@ -175,7 +179,7 @@ jobs:
           # --- Out-of-tree modules ---
           MODDIR="${OUTDIR}/lib/modules/${KERNEL_VERSION}/extra"
           mkdir -p "${MODDIR}"
-          for mod in al_eth al_dma al_ssm al_sgpo; do
+          for mod in al_eth al_dma al_ssm al_sgpo rtl8370mb; do
             find "/tmp/build-${mod}" -name '*.ko' -exec cp {} "${MODDIR}/" \; 2>/dev/null || true
           done
           aarch64-linux-gnu-strip --strip-unneeded "${MODDIR}"/*.ko 2>/dev/null || true
@@ -243,7 +247,8 @@ jobs:
             | `uImage` | U-Boot kernel image (bootm) |
             | `Image` | Raw ARM64 kernel binary (booti) |
             | `*.dtb` | Device tree blob |
-            | `lib/modules/*/extra/al_eth.ko` | 1GbE + 10GbE Ethernet (+ RTL8370 switch on UDM Pro) |
+            | `lib/modules/*/extra/al_eth.ko` | 1GbE + 10GbE Ethernet |
+            | `lib/modules/*/extra/rtl8370mb_init.ko` | RTL8370MB 8-port switch init (UDM Pro only) |
             | `lib/modules/*/extra/al_dma.ko` | RAID5/6 HW parity (XOR/PQ) |
             | `lib/modules/*/extra/al_ssm.ko` | HW AES-XTS/CBC crypto acceleration |
             | `lib/modules/*/extra/al_sgpo.ko` | Serial GPIO (HDD/SATA LEDs) |

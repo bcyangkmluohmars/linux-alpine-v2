@@ -1,0 +1,16 @@
+# Kernel build artifacts
+*.o
+*.ko
+*.mod
+*.mod.c
+.*.cmd
+modules.order
+Module.symvers
+.module-common.o
+
+# Image outputs
+*.img
+*.img.gz
+
+# Build outputs
+build/

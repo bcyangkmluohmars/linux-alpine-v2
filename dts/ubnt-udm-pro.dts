@@ -1,0 +1,576 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * Ubiquiti UniFi Dream Machine Pro (UDM-Pro)
+ * Annapurna Labs Alpine V2 (AL-524) — 4× Cortex-A72, 4GB RAM
+ *
+ * Dumped from live device (4.19.152-ui-alpine) on 2026-03-25
+ * For use with mainline Linux 6.12+
+ *
+ * Copyright (C) 2026 Kevin — secfirstgw-rs project
+ */
+
+/dts-v1/;
+
+#include <dt-bindings/interrupt-controller/arm-gic.h>
+
+/ {
+	model = "Ubiquiti UniFi Dream Machine Pro";
+	compatible = "ubnt,udm-pro", "al,alpine-v2";
+	interrupt-parent = <&gic>;
+	#address-cells = <2>;
+	#size-cells = <2>;
+
+	aliases {
+		serial0 = &uart0;
+	};
+
+	chosen {
+		stdout-path = "serial0:115200n8";
+		bootargs = "pci=pcie_bus_perf console=ttyS0,115200 net.ifnames=0";
+	};
+
+	reserved-memory {
+		#address-cells = <2>;
+		#size-cells = <2>;
+		ranges;
+
+		/* Secure Monitor firmware */
+		firmware: firmware@0 {
+			reg = <0x0 0x0 0x0 0x100000>;
+			no-map;
+		};
+	};
+
+	memory@0 {
+		device_type = "memory";
+		/* 4GB RAM — verify exact layout on target */
+		reg = <0x0 0x0 0x0 0x40000000>,       /* 0 - 1GB */
+		      <0x0 0x40000000 0x0 0x40000000>, /* 1GB - 2GB */
+		      <0x0 0x80000000 0x0 0x40000000>, /* 2GB - 3GB */
+		      <0x0 0xc0000000 0x0 0x20000000>; /* 3GB - 3.5GB (top cutoff) */
+	};
+
+	cpus {
+		#address-cells = <2>;
+		#size-cells = <0>;
+
+		cpu@0 {
+			compatible = "arm,cortex-a72";
+			device_type = "cpu";
+			reg = <0x0 0x0>;
+			enable-method = "psci";
+		};
+
+		cpu@1 {
+			compatible = "arm,cortex-a72";
+			device_type = "cpu";
+			reg = <0x0 0x1>;
+			enable-method = "psci";
+		};
+
+		cpu@2 {
+			compatible = "arm,cortex-a72";
+			device_type = "cpu";
+			reg = <0x0 0x2>;
+			enable-method = "psci";
+		};
+
+		cpu@3 {
+			compatible = "arm,cortex-a72";
+			device_type = "cpu";
+			reg = <0x0 0x3>;
+			enable-method = "psci";
+		};
+	};
+
+	psci {
+		compatible = "arm,psci-0.2", "arm,psci";
+		method = "smc";
+		cpu_suspend = <0x84000001>;
+		cpu_off = <0x84000002>;
+		cpu_on = <0x84000003>;
+	};
+
+	clocks {
+		#address-cells = <1>;
+		#size-cells = <0>;
+
+		sbclk: sbclk {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <500000000>; /* 500 MHz (0x1dcd6500) */
+		};
+
+		cpuclk: cpuclk {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <1000000>; /* 1 MHz reference */
+		};
+
+		nbclk: nbclk {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <933267464>; /* 0x37a18808 — ~933 MHz NB clock */
+		};
+
+		refclk: refclk {
+			compatible = "fixed-clock";
+			#clock-cells = <0>;
+			clock-frequency = <100000000>; /* 100 MHz */
+		};
+	};
+
+	timer {
+		compatible = "arm,armv8-timer";
+		interrupts = <GIC_PPI 13 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_PPI 14 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_PPI 11 IRQ_TYPE_LEVEL_LOW>,
+			     <GIC_PPI 10 IRQ_TYPE_LEVEL_LOW>;
+	};
+
+	pmu {
+		compatible = "arm,cortex-a72-pmu";
+		interrupts = <GIC_SPI 104 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 105 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 106 IRQ_TYPE_LEVEL_HIGH>,
+			     <GIC_SPI 107 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
+	thermal-zones {
+		cpu-thermal {
+			thermal-sensors = <&thermal0>;
+			polling-delay = <1000>;
+			polling-delay-passive = <250>;
+			trips {
+				cpu-crit {
+					type = "critical";
+					temperature = <105000>;
+					hysteresis = <2000>;
+				};
+			};
+		};
+	};
+
+	soc {
+		compatible = "simple-bus";
+		#address-cells = <2>;
+		#size-cells = <2>;
+		interrupt-parent = <&gic>;
+		ranges;
+
+		/* ============================================
+		 * Interrupt Controller — GICv3
+		 * ============================================ */
+
+		gic: interrupt-controller@f0200000 {
+			compatible = "arm,gic-v3";
+			reg = <0x0 0xf0200000 0x0 0x10000>,  /* GICD */
+			      <0x0 0xf0280000 0x0 0x200000>, /* GICR */
+			      <0x0 0xf0100000 0x0 0x2000>,   /* GICC */
+			      <0x0 0xf0110000 0x0 0x2000>,   /* GICV */
+			      <0x0 0xf0120000 0x0 0x2000>;   /* GICH */
+			interrupts = <GIC_PPI 9 IRQ_TYPE_LEVEL_HIGH>;
+			interrupt-controller;
+			#interrupt-cells = <3>;
+		};
+
+		/* ============================================
+		 * System Fabric
+		 * ============================================ */
+
+		nb_service: nb-service@f0070000 {
+			compatible = "annapurna-labs,al-nb-service",
+				     "al,alpine-sysfabric-service",
+				     "syscon";
+			reg = <0x0 0xf0070000 0x0 0x10000>;
+			interrupts = <GIC_SPI 96 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 97 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 98 IRQ_TYPE_LEVEL_HIGH>,
+				     <GIC_SPI 99 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		ccu: ccu@f0090000 {
+			compatible = "annapurna-labs,al-ccu";
+			reg = <0x0 0xf0090000 0x0 0x10000>;
+			io_coherency = <1>;
+		};
+
+		mc: memory-controller@f0080000 {
+			compatible = "annapurna-labs,alpine-mc";
+			reg = <0x0 0xf0080000 0x0 0x10000>;
+		};
+
+		/* ============================================
+		 * MSI Controller
+		 * ============================================ */
+
+		msix: msix@fbe00000 {
+			compatible = "annapurna-labs,alpine-msix", "al,alpine-msix";
+			reg = <0x0 0xfbe00000 0x0 0x100000>;
+			interrupt-parent = <&gic>;
+			interrupts = <GIC_SPI 160 IRQ_TYPE_EDGE_RISING>,
+				     <GIC_SPI 319 IRQ_TYPE_EDGE_RISING>;
+			interrupt-controller;
+			msi-controller;
+			al,msi-base-spi = <161>;
+			al,msi-num-spis = <158>;
+		};
+
+		/* ============================================
+		 * Internal PCIe Bus
+		 * Devices: 2× GbE, 2× 10G SFP+, Crypto, DMA, SATA
+		 * ============================================ */
+
+		pcie_internal: pci@fbc00000 {
+			compatible = "pci-host-ecam-generic";
+			device_type = "pci";
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			reg = <0x0 0xfbc00000 0x0 0x100000>;
+			bus-range = <0x00 0x00>;
+			interrupt-map-mask = <0xf800 0 0 7>;
+			interrupt-map = <0x4000 0 0 1 &gic GIC_SPI 53 IRQ_TYPE_LEVEL_HIGH>,
+					<0x4800 0 0 1 &gic GIC_SPI 54 IRQ_TYPE_LEVEL_HIGH>;
+			ranges = <0x2000000 0x0 0xfe000000 0x0 0xfe000000 0x0 0x1000000>;
+			dma-coherent;
+			msi-parent = <&msix>;
+		};
+
+		/* ============================================
+		 * External PCIe — Port 0 (USB 3.0 ASMedia)
+		 * ============================================ */
+
+		pcie_external0: pcie@fd800000 {
+			compatible = "amazon,al-alpine-v2-pcie";
+			device_type = "pci";
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			reg = <0x0 0xfd800000 0x0 0x20000>;
+			reg-names = "ecam";
+			bus-range = <0x00 0xff>;
+			interrupt-map-mask = <0x0 0 0 7>;
+			interrupt-map = <0x0 0 0 1 &gic GIC_SPI 41 IRQ_TYPE_LEVEL_HIGH>;
+			ranges = <0x0 0x0 0xfb600000 0x0 0xfb600000 0x0 0x100000>,
+				 <0x1000000 0x0 0x0 0x0 0xc0000000 0x0 0x100000>,
+				 <0x2000000 0x0 0xc0010000 0x0 0xc0010000 0x0 0x7ff0000>;
+			dma-coherent;
+			msi-parent = <&msix>;
+			cfg-space-offset = <0x10000>;
+			status = "okay";
+		};
+
+		/* ============================================
+		 * External PCIe — Port 1 (disabled)
+		 * ============================================ */
+
+		pcie_external1: pcie@fd820000 {
+			compatible = "amazon,al-alpine-v2-pcie";
+			device_type = "pci";
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			reg = <0x0 0xfd820000 0x0 0x20000>;
+			reg-names = "ecam";
+			bus-range = <0x00 0xff>;
+			interrupt-map-mask = <0x0 0 0 7>;
+			interrupt-map = <0x0 0 0 1 &gic GIC_SPI 42 IRQ_TYPE_LEVEL_HIGH>;
+			ranges = <0x0 0x0 0xfb700000 0x0 0xfb700000 0x0 0x100000>,
+				 <0x1000000 0x0 0x0 0x0 0xc8000000 0x0 0x100000>,
+				 <0x2000000 0x0 0xc8010000 0x0 0xc8010000 0x0 0x7ff0000>;
+			dma-coherent;
+			msi-parent = <&msix>;
+			cfg-space-offset = <0x2000>;
+			status = "disabled";
+		};
+
+		/* ============================================
+		 * External PCIe — Port 2 (disabled)
+		 * ============================================ */
+
+		pcie_external2: pcie@fd840000 {
+			compatible = "amazon,al-alpine-v2-pcie";
+			device_type = "pci";
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			reg = <0x0 0xfd840000 0x0 0x20000>;
+			reg-names = "ecam";
+			bus-range = <0x00 0xff>;
+			interrupt-map-mask = <0x0 0 0 7>;
+			interrupt-map = <0x0 0 0 1 &gic GIC_SPI 43 IRQ_TYPE_LEVEL_HIGH>;
+			ranges = <0x0 0x0 0xfb800000 0x0 0xfb800000 0x0 0x100000>,
+				 <0x1000000 0x0 0x0 0x0 0xd0000000 0x0 0x100000>,
+				 <0x2000000 0x0 0xd0010000 0x0 0xd0010000 0x0 0x7ff0000>;
+			dma-coherent;
+			msi-parent = <&msix>;
+			cfg-space-offset = <0x2000>;
+			status = "disabled";
+		};
+
+		/* ============================================
+		 * External PCIe — Port 3 (disabled)
+		 * ============================================ */
+
+		pcie_external3: pcie@fd900000 {
+			compatible = "amazon,al-alpine-v2-pcie";
+			device_type = "pci";
+			#address-cells = <3>;
+			#size-cells = <2>;
+			#interrupt-cells = <1>;
+			reg = <0x0 0xfd900000 0x0 0x20000>;
+			reg-names = "ecam";
+			bus-range = <0x00 0xff>;
+			interrupt-map-mask = <0x0 0 0 7>;
+			interrupt-map = <0x0 0 0 1 &gic GIC_SPI 44 IRQ_TYPE_LEVEL_HIGH>;
+			ranges = <0x0 0x0 0xfb900000 0x0 0xfb900000 0x0 0x100000>,
+				 <0x1000000 0x0 0x0 0x0 0xd8000000 0x0 0x100000>,
+				 <0x2000000 0x0 0xd8010000 0x0 0xd8010000 0x0 0x7ff0000>;
+			dma-coherent;
+			msi-parent = <&msix>;
+			cfg-space-offset = <0x2000>;
+			status = "disabled";
+		};
+
+		/* ============================================
+		 * Ethernet MACs (al_eth driver)
+		 * ============================================ */
+
+		/* GbE Port — Switch uplink (RTL8370MB) */
+		eth0: ethernet@fc000000 {
+			reg = <0x0 0xfc000000 0x0 0x1000>;
+			interrupts = <GIC_SPI 61 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/* GbE Port — WAN */
+		eth1: ethernet@fc100000 {
+			reg = <0x0 0xfc100000 0x0 0x1000>;
+			interrupts = <GIC_SPI 62 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/* 10G SFP+ Port 1 (WAN SFP+) */
+		eth2: ethernet@fc200000 {
+			reg = <0x0 0xfc200000 0x0 0x1000>;
+			interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/* 10G SFP+ Port 2 (LAN SFP+) */
+		eth3: ethernet@fc300000 {
+			reg = <0x0 0xfc300000 0x0 0x1000>;
+			interrupts = <GIC_SPI 64 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		/* ============================================
+		 * I/O Fabric
+		 * ============================================ */
+
+		pbs: pbs@fd8a8000 {
+			compatible = "annapurna-labs,al-pbs";
+			reg = <0x0 0xfd8a8000 0x0 0x1000>;
+			interrupts = <GIC_SPI 0 IRQ_TYPE_LEVEL_HIGH>;
+		};
+
+		thermal0: thermal@fd8a0a00 {
+			compatible = "al,alpine-thermal";
+			reg = <0x0 0xfd8a0a00 0x0 0x100>;
+			#thermal-sensor-cells = <0>;
+		};
+
+		serdes: serdes@fd8c0000 {
+			compatible = "annapurna-labs,al-serdes";
+			reg = <0x0 0xfd8c0000 0x0 0x2400>;
+		};
+
+		/* ============================================
+		 * UARTs (ns16550a, 500 MHz clock)
+		 * ============================================ */
+
+		uart0: serial@fd883000 {
+			compatible = "ns16550a";
+			reg = <0x0 0xfd883000 0x0 0x1000>;
+			interrupts = <GIC_SPI 17 IRQ_TYPE_LEVEL_HIGH>;
+			clock-frequency = <500000000>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			status = "okay";
+		};
+
+		uart1: serial@fd884000 {
+			compatible = "ns16550a";
+			reg = <0x0 0xfd884000 0x0 0x1000>;
+			interrupts = <GIC_SPI 18 IRQ_TYPE_LEVEL_HIGH>;
+			clock-frequency = <500000000>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			status = "disabled";
+		};
+
+		uart2: serial@fd885000 {
+			compatible = "ns16550a";
+			reg = <0x0 0xfd885000 0x0 0x1000>;
+			interrupts = <GIC_SPI 19 IRQ_TYPE_LEVEL_HIGH>;
+			clock-frequency = <500000000>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			status = "disabled";
+		};
+
+		uart3: serial@fd886000 {
+			compatible = "ns16550a";
+			reg = <0x0 0xfd886000 0x0 0x1000>;
+			interrupts = <GIC_SPI 20 IRQ_TYPE_LEVEL_HIGH>;
+			clock-frequency = <500000000>;
+			reg-shift = <2>;
+			reg-io-width = <4>;
+			status = "disabled";
+		};
+
+		/* ============================================
+		 * I2C Buses (DesignWare)
+		 * ============================================ */
+
+		/* I2C General — disabled on UDM Pro */
+		i2c_gen: i2c@fd894000 {
+			compatible = "snps,designware-i2c";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			reg = <0x0 0xfd894000 0x0 0x1000>;
+			interrupts = <GIC_SPI 8 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-frequency = <100000>;
+			status = "disabled";
+		};
+
+		/* I2C PLD — Switch management, GPIO expander, I2C mux */
+		i2c_pld: i2c@fd880000 {
+			compatible = "snps,designware-i2c";
+			#address-cells = <1>;
+			#size-cells = <0>;
+			reg = <0x0 0xfd880000 0x0 0x1000>;
+			interrupts = <GIC_SPI 21 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-frequency = <100000>;
+			i2c-sda-hold-time-ns = <350>;
+			status = "okay";
+
+			/* RTL8370MB 8-Port GbE Switch */
+			switch: rtl8370mb@11 {
+				compatible = "realtek,rtl8370mb";
+				reg = <0x11>;
+			};
+
+			/* PCA9575 GPIO Expander — HDD LEDs / Power */
+			gpio_exp: gpio@28 {
+				compatible = "nxp,pca9575";
+				reg = <0x28>;
+				gpio-controller;
+				#gpio-cells = <2>;
+			};
+
+			/* PCA9546 I2C Mux */
+			i2c_mux: i2c-mux@71 {
+				compatible = "pca9546";
+				reg = <0x71>;
+			};
+		};
+
+		/* ============================================
+		 * Timers (ARM SP804)
+		 * ============================================ */
+
+		timer0: timer@fd890000 {
+			compatible = "arm,sp804", "arm,primecell";
+			reg = <0x0 0xfd890000 0x0 0x1000>;
+			interrupts = <GIC_SPI 9 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		timer1: timer@fd891000 {
+			compatible = "arm,sp804", "arm,primecell";
+			reg = <0x0 0xfd891000 0x0 0x1000>;
+			interrupts = <GIC_SPI 10 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+			status = "disabled";
+		};
+
+		timer2: timer@fd892000 {
+			compatible = "arm,sp804", "arm,primecell";
+			reg = <0x0 0xfd892000 0x0 0x1000>;
+			interrupts = <GIC_SPI 11 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+			status = "disabled";
+		};
+
+		timer3: timer@fd893000 {
+			compatible = "arm,sp804", "arm,primecell";
+			reg = <0x0 0xfd893000 0x0 0x1000>;
+			interrupts = <GIC_SPI 12 IRQ_TYPE_LEVEL_HIGH>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+			status = "disabled";
+		};
+
+		/* ============================================
+		 * Watchdogs (ARM SP805)
+		 * ============================================ */
+
+		watchdog0: wdt@fd88c000 {
+			compatible = "arm,sp805", "arm,primecell";
+			reg = <0x0 0xfd88c000 0x0 0x1000>;
+			clocks = <&sbclk>;
+			clock-names = "apb_pclk";
+		};
+
+		reboot {
+			compatible = "al,alpine-reboot";
+			wdt-parent = <&watchdog0>;
+		};
+
+		/* ============================================
+		 * SGPO (Serial GPIO — LEDs)
+		 * ============================================ */
+
+		sgpo: sgpo@fd8b4000 {
+			compatible = "annapurna-labs,alpine-sgpo";
+			reg = <0x0 0xfd8b4000 0x0 0x5000>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			baseidx = <0x30>;
+		};
+
+		/* ============================================
+		 * SATA SW LEDs
+		 * ============================================ */
+
+		sata_sw_leds: sata-leds {
+			compatible = "annapurna-labs,al-sata-sw-leds";
+
+			led@0 {
+				label = "host 1, port 0 activity&presence led";
+				slot-no = <1>;
+				pci_domain = <0>;
+				pci_bus = <0>;
+				pci_dev = <8>;
+				port = <0>;
+				gpios = <&sgpo 6 0>;
+			};
+		};
+
+		/* ============================================
+		 * HDD Power Control
+		 * ============================================ */
+
+		hdd_pwrctl: hdd-power {
+			compatible = "ui,hdd-pwrctl";
+
+			hdd@0 {
+				slot-no = <1>;
+				fault-led = <&gpio_exp 5 0>;
+			};
+		};
+	};
+};

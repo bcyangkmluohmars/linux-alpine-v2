@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0
 /*
- * rtl8370mb_init.c — RTL8370MB switch init for UDM Pro (Alpine V2)
+ * rtl8370mb_init.c — RTL8370MB switch init + userspace SMI for UDM Pro
  *
  * SMI-over-MDIO at PHY address 0x1D (Realtek default) on eth1's MDIO bus.
  * See kernel/RTL8370MB.md for full hardware documentation.
@@ -11,12 +11,20 @@
  *   3. Set port isolation: all LAN ports + CPU port
  *   4. Set STP state to forwarding
  *   5. Enable MAC learning
+ *
+ * Userspace SMI:
+ *   /dev/rtl8370mb — misc chardev for atomic SMI read/write.
+ *   The MDIO bus mutex is held for the full 4-op SMI sequence,
+ *   so PHY polling cannot corrupt the transaction.
  */
 
 #include <linux/module.h>
 #include <linux/kernel.h>
 #include <linux/delay.h>
 #include <linux/phy.h>
+#include <linux/miscdevice.h>
+#include <linux/fs.h>
+#include <linux/uaccess.h>
 
 /* ── SMI-over-MDIO protocol ──────────────────────────────────────────── */
 #define SMI_CTRL0_REG		31
@@ -88,7 +96,20 @@
 /* Shared MDIO bus from al_eth (on eth1) */
 extern struct mii_bus *alpine_shared_mdio_bus;
 
-/* ── SMI read/write ──────────────────────────────────────────────────── */
+static struct mii_bus *rtl_bus;
+
+/* ── Userspace ioctl interface ──────────────────────────────────────── */
+
+struct rtl8370mb_smi_msg {
+	__u16 reg;
+	__u16 val;
+};
+
+#define RTL8370MB_IOC_MAGIC	'R'
+#define RTL8370MB_SMI_READ	_IOWR(RTL8370MB_IOC_MAGIC, 1, struct rtl8370mb_smi_msg)
+#define RTL8370MB_SMI_WRITE	_IOW(RTL8370MB_IOC_MAGIC, 2, struct rtl8370mb_smi_msg)
+
+/* ── SMI read/write (atomic — holds mdio_lock for full sequence) ───── */
 
 static int smi_read(struct mii_bus *bus, u32 reg, u32 *val)
 {
@@ -160,9 +181,54 @@ static int smi_update(struct mii_bus *bus, u32 reg, u32 mask, u32 val)
 	return smi_write(bus, reg, (orig & ~mask) | (val & mask));
 }
 
+/* ── chardev ioctl ──────────────────────────────────────────────────── */
+
+static long rtl8370mb_ioctl(struct file *file, unsigned int cmd,
+			     unsigned long arg)
+{
+	struct rtl8370mb_smi_msg msg;
+	u32 val;
+	int ret;
+
+	if (!rtl_bus)
+		return -ENODEV;
+
+	if (copy_from_user(&msg, (void __user *)arg, sizeof(msg)))
+		return -EFAULT;
+
+	switch (cmd) {
+	case RTL8370MB_SMI_READ:
+		ret = smi_read(rtl_bus, msg.reg, &val);
+		if (ret)
+			return ret;
+		msg.val = val & 0xFFFF;
+		if (copy_to_user((void __user *)arg, &msg, sizeof(msg)))
+			return -EFAULT;
+		return 0;
+
+	case RTL8370MB_SMI_WRITE:
+		return smi_write(rtl_bus, msg.reg, msg.val);
+
+	default:
+		return -ENOTTY;
+	}
+}
+
+static const struct file_operations rtl8370mb_fops = {
+	.owner		= THIS_MODULE,
+	.unlocked_ioctl	= rtl8370mb_ioctl,
+	.compat_ioctl	= rtl8370mb_ioctl,
+};
+
+static struct miscdevice rtl8370mb_misc = {
+	.minor	= MISC_DYNAMIC_MINOR,
+	.name	= "rtl8370mb",
+	.fops	= &rtl8370mb_fops,
+};
+
 /* ── Module init ─────────────────────────────────────────────────────── */
 
-static int __init rtl8370mb_init(void)
+static int __init rtl8370mb_module_init(void)
 {
 	struct mii_bus *bus;
 	u32 chip_id = 0, chip_ver = 0;
@@ -254,21 +320,35 @@ static int __init rtl8370mb_init(void)
 		  CPU_CTRL_EN | CPU_CTRL_INSERTMODE_NONE | CPU_CTRL_TRAP_PORT_1);
 
 	pr_info("rtl8370mb: initialized — 8 LAN ports bridged to EXT1 (RGMII 1000M)\n");
-	ret = 0;
+
+	/* Register chardev for userspace SMI access */
+	rtl_bus = bus;
+	ret = misc_register(&rtl8370mb_misc);
+	if (ret) {
+		pr_err("rtl8370mb: misc_register failed: %d\n", ret);
+		rtl_bus = NULL;
+	} else {
+		pr_info("rtl8370mb: /dev/rtl8370mb ready\n");
+	}
+
+	smi_write(bus, MAGIC_REG, 0x0000);
+	return 0;
 
 lock:
 	smi_write(bus, MAGIC_REG, 0x0000);
 	return ret;
 }
 
-static void __exit rtl8370mb_exit(void)
+static void __exit rtl8370mb_module_exit(void)
 {
+	misc_deregister(&rtl8370mb_misc);
+	rtl_bus = NULL;
 	pr_info("rtl8370mb: unloaded\n");
 }
 
-module_init(rtl8370mb_init);
-module_exit(rtl8370mb_exit);
+module_init(rtl8370mb_module_init);
+module_exit(rtl8370mb_module_exit);
 
 MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("RTL8370MB switch init for UDM Pro — SMI via MDIO addr 0x1D");
+MODULE_DESCRIPTION("RTL8370MB switch init + userspace SMI for UDM Pro");
 MODULE_AUTHOR("secfirst");

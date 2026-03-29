@@ -5516,8 +5516,10 @@ al_eth_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 
 	netdev->vlan_features |= netdev->features;
 
-	/* set this after vlan_features since it cannot be part of vlan_features */
-	netdev->features |= NETIF_F_HW_VLAN_CTAG_RX;
+	/* Do NOT enable NETIF_F_HW_VLAN_CTAG_RX — the switch trunk (sw0)
+	 * uses 802.1Q VLAN sub-interfaces (sw0.10, sw0.3000, etc.) that
+	 * need the VLAN tag to reach the network stack intact. HW stripping
+	 * would silently eat all VLAN tags and break zone isolation. */
 
 	netdev->priv_flags |= IFF_UNICAST_FLT;
 

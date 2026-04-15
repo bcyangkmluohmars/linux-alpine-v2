@@ -247,7 +247,7 @@ static int al_ssm_do_crypt(struct al_ssm_ctx *ctx,
 	struct al_ssm_chan *chan;
 	struct al_crypto_transaction xaction;
 	struct al_crypto_sa sa;
-	struct al_crypto_hw_sa hw_sa;
+	struct al_crypto_hw_sa *hw_sa = NULL;
 	struct al_buf src_buf, dst_buf;
 	struct al_block src_block, dst_block;
 	dma_addr_t src_dma, dst_dma, sa_dma, iv_dma;
@@ -313,16 +313,20 @@ static int al_ssm_do_crypt(struct al_ssm_ctx *ctx,
 	/* Copy IV into SA */
 	memcpy(sa.enc_iv, iv_buf, AES_BLOCK_SIZE);
 
-	/* Initialize hardware SA */
-	memset(&hw_sa, 0, sizeof(hw_sa));
-	al_crypto_hw_sa_init(&sa, &hw_sa);
-
-	/* Allocate SA DMA */
-	sa_dma = dma_map_single(dev->dev, &hw_sa, sizeof(hw_sa), DMA_TO_DEVICE);
-	if (dma_mapping_error(dev->dev, sa_dma)) {
+	/*
+	 * IMPORTANT:
+	 * Don't DMA-map stack memory here. On kernels with VMAP_STACK,
+	 * stack addresses are vmalloc-backed and dma_map_single() will
+	 * reject them ("rejecting DMA map of vmalloc memory"), which can
+	 * cascade into dm-crypt I/O failures.
+	 */
+	hw_sa = dma_alloc_coherent(dev->dev, sizeof(*hw_sa), &sa_dma, GFP_KERNEL);
+	if (!hw_sa) {
 		rc = -ENOMEM;
 		goto out_free_iv;
 	}
+	memset(hw_sa, 0, sizeof(*hw_sa));
+	al_crypto_hw_sa_init(&sa, hw_sa);
 
 	/* Set up source block */
 	src_buf.addr = src_dma;
@@ -347,7 +351,7 @@ static int al_ssm_do_crypt(struct al_ssm_ctx *ctx,
 	/* SA update - push our SA to the engine */
 	xaction.sa_indx = 0; /* Use SA index 0 */
 	xaction.sa_in.addr = sa_dma;
-	xaction.sa_in.len = sizeof(hw_sa);
+	xaction.sa_in.len = sizeof(*hw_sa);
 
 	/* Set IV */
 	xaction.enc_iv_in.addr = iv_dma;
@@ -403,7 +407,8 @@ static int al_ssm_do_crypt(struct al_ssm_ctx *ctx,
 	rc = 0;
 
 out_unmap_sa:
-	dma_unmap_single(dev->dev, sa_dma, sizeof(hw_sa), DMA_TO_DEVICE);
+	if (hw_sa)
+		dma_free_coherent(dev->dev, sizeof(*hw_sa), hw_sa, sa_dma);
 out_free_iv:
 	dma_free_coherent(dev->dev, AES_BLOCK_SIZE, iv_buf, iv_dma);
 out_free_dst:

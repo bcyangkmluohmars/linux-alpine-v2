@@ -21,14 +21,36 @@ jobs:
     strategy:
       matrix:
         target:
-          - name: unvr
+          - name: unvr-legacy
             defconfig: unvr_defconfig
             dts: alpine-v2-ubnt-unvr
             description: "Ubiquiti UNVR (NAS)"
-          - name: udmpro
+            boot_format: legacy
+            load_addr: "0x08000000"
+            entry_addr: "0x08000000"
+          - name: unvr-fit
+            defconfig: unvr_defconfig
+            dts: alpine-v2-ubnt-unvr
+            description: "Ubiquiti UNVR (NAS)"
+            boot_format: fit
+            load_addr: "0x08000000"
+            entry_addr: "0x08000000"
+            fdt_load_addr: "0x04078000"
+          - name: udmpro-legacy
             defconfig: udmpro_defconfig
             dts: alpine-v2-ubnt-udmpro
             description: "Ubiquiti UDM Pro (Gateway)"
+            boot_format: legacy
+            load_addr: "0x04080000"
+            entry_addr: "0x04080000"
+          - name: udmpro-fit
+            defconfig: udmpro_defconfig
+            dts: alpine-v2-ubnt-udmpro
+            description: "Ubiquiti UDM Pro (Gateway)"
+            boot_format: fit
+            load_addr: "0x04080000"
+            entry_addr: "0x04080000"
+            fdt_load_addr: "0x04078000"
     outputs:
       kernel_version: ${{ steps.resolve.outputs.kernel_version }}
     steps:
@@ -129,13 +151,57 @@ jobs:
             ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
             -j"$(nproc)" Image dtbs modules
 
-      - name: Create uImage
+      - name: Create uImage (${{ matrix.target.boot_format }})
         run: |
-          mkimage -A arm64 -O linux -T kernel -C none \
-            -a 0x00080000 -e 0x00080000 \
-            -n "Linux ${KERNEL_VERSION} Alpine V2 (${{ matrix.target.name }})" \
-            -d "linux-${KERNEL_VERSION}/arch/arm64/boot/Image" \
-            "linux-${KERNEL_VERSION}/uImage"
+          KDIR="linux-${KERNEL_VERSION}"
+
+          if [ "${{ matrix.target.boot_format }}" = "fit" ]; then
+            # FIT image (kernel + DTB bundled, gzip compressed)
+            gzip -c "${KDIR}/arch/arm64/boot/Image" > "${KDIR}/Image.gz"
+            cat > "${KDIR}/fitimage.its" << ITSEOF
+          /dts-v1/;
+          / {
+              description = "Linux ${KERNEL_VERSION} Alpine V2 (${{ matrix.target.name }})";
+              #address-cells = <1>;
+              images {
+                  kernel {
+                      description = "Linux ${KERNEL_VERSION}";
+                      data = /incbin/("Image.gz");
+                      type = "kernel";
+                      arch = "arm64";
+                      os = "linux";
+                      compression = "gzip";
+                      load = <${{ matrix.target.load_addr }}>;
+                      entry = <${{ matrix.target.entry_addr }}>;
+                  };
+                  fdt {
+                      description = "${{ matrix.target.description }} DTB";
+                      data = /incbin/("arch/arm64/boot/dts/amazon/${{ matrix.target.dts }}.dtb");
+                      type = "flat_dt";
+                      arch = "arm64";
+                      compression = "none";
+                      load = <${{ matrix.target.fdt_load_addr }}>;
+                  };
+              };
+              configurations {
+                  default = "${{ matrix.target.name }}";
+                  ${{ matrix.target.name }} {
+                      description = "${{ matrix.target.description }}";
+                      kernel = "kernel";
+                      fdt = "fdt";
+                  };
+              };
+          };
+          ITSEOF
+            mkimage -f "${KDIR}/fitimage.its" "${KDIR}/uImage"
+          else
+            # Legacy uImage (uncompressed)
+            mkimage -A arm64 -O linux -T kernel -C none \
+              -a ${{ matrix.target.load_addr }} -e ${{ matrix.target.entry_addr }} \
+              -n "Linux ${KERNEL_VERSION} Alpine V2 (${{ matrix.target.name }})" \
+              -d "${KDIR}/arch/arm64/boot/Image" \
+              "${KDIR}/uImage"
+          fi
 
       - name: Build out-of-tree modules
         run: |
@@ -224,23 +290,41 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            linux-alpine-v2-unvr/linux-alpine-v2-unvr-*.tar.gz
-            linux-alpine-v2-udmpro/linux-alpine-v2-udmpro-*.tar.gz
+            linux-alpine-v2-unvr-legacy/linux-alpine-v2-unvr-legacy-*.tar.gz
+            linux-alpine-v2-unvr-fit/linux-alpine-v2-unvr-fit-*.tar.gz
+            linux-alpine-v2-udmpro-legacy/linux-alpine-v2-udmpro-legacy-*.tar.gz
+            linux-alpine-v2-udmpro-fit/linux-alpine-v2-udmpro-fit-*.tar.gz
           generate_release_notes: true
           body: |
             ## Linux ${{ needs.build.outputs.kernel_version }} for Alpine V2
 
             Pre-built kernels and modules for Annapurna Labs Alpine V2 (AL-314) SoC.
-            Both targets use U-Boot — flash `uImage` + DTB to the kernel partition.
 
-            ### Targets
+            ### Boot Image Formats
 
-            | Target | Tarball | Device | Use Case |
-            |--------|---------|--------|----------|
-            | **unvr** | `linux-alpine-v2-unvr-*.tar.gz` | Ubiquiti UNVR | secfirstNAS |
-            | **udmpro** | `linux-alpine-v2-udmpro-*.tar.gz` | Ubiquiti UDM Pro | secfirstGW |
+            Both devices use U-Boot `bootm`, but the expected image format differs.
+            Each device/format combination is provided as a separate tarball.
 
-            ### Contents (per target)
+            **From our testing:**
+            - **UNVR** booted with **legacy uImage** (load 0x08000000)
+            - **UDM Pro** booted with **FIT image** (load 0x04080000, gzip, bundled DTB)
+
+            We provide both formats for both devices because U-Boot configurations
+            can vary between firmware versions. If the default format for your device
+            doesn't boot, try the other one. **Always keep a backup of your working
+            uImage before flashing** — flashing the wrong format will require UART
+            recovery.
+
+            ### Tarballs
+
+            | Tarball | Device | Format | Status |
+            |---------|--------|--------|--------|
+            | `linux-alpine-v2-unvr-legacy-*` | UNVR | Legacy uImage | Tested, working |
+            | `linux-alpine-v2-unvr-fit-*` | UNVR | FIT image | Untested |
+            | `linux-alpine-v2-udmpro-fit-*` | UDM Pro | FIT image | Tested, working |
+            | `linux-alpine-v2-udmpro-legacy-*` | UDM Pro | Legacy uImage | Untested |
+
+            ### Contents (per tarball)
 
             | File | Description |
             |------|-------------|
@@ -265,7 +349,10 @@ jobs:
             ### Quick Start
 
             ```bash
-            tar xzf linux-alpine-v2-<target>-*.tar.gz
+            # IMPORTANT: always backup before flashing!
+            ssh root@<device> "cp /boot/uImage /boot/uImage.bak"
+
+            tar xzf linux-alpine-v2-<target>-<format>-*.tar.gz
             scp uImage *.dtb root@<device>:/boot/
             scp -r lib/modules/* root@<device>:/lib/modules/
             ssh root@<device> "depmod -a && reboot"

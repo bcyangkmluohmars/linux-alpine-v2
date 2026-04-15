@@ -2,7 +2,7 @@
 /*
  * Annapurna Labs Alpine V2 SSM (Security Services Module) Crypto Driver
  *
- * PCI driver for the Alpine V2 SoC hardware crypto engine.
+ * Asynchronous PCI driver for the Alpine V2 SoC hardware crypto engine.
  * Registers AES-XTS and AES-CBC with the Linux crypto framework
  * so dm-crypt/LUKS can use hardware-accelerated encryption transparently.
  *
@@ -10,15 +10,19 @@
  * BAR 0: UDMA registers (128KB)
  * BAR 4: Application/crypto registers (64KB)
  *
- * The SSM uses the same UDMA (Unified DMA) infrastructure as the Ethernet
- * and DMA/RAID engines. It provides an M2S (Memory-to-Stream) + S2M
- * (Stream-to-Memory) DMA pair connected to a crypto engine.
- *
  * Architecture:
- *   Linux crypto API  ->  this driver  ->  AL HAL SSM crypto  ->  UDMA DMA  ->  HW crypto engine
+ *   dm-crypt  ->  Linux crypto API (async skcipher)
+ *             ->  this driver: enqueue, submit to HW, return -EINPROGRESS
+ *             ->  completion workqueue polls UDMA, calls skcipher_request_complete()
+ *             ->  AL HAL SSM crypto  ->  UDMA DMA  ->  HW crypto engine
+ *
+ * IMPORTANT: The UDMA requires SEPARATE DMA buffers for submission
+ * descriptor rings and completion descriptor rings. Sharing the same
+ * buffer causes corruption when multiple operations are in-flight
+ * because the hardware overwrites submission descriptors with completion data.
  *
  * Copyright (C) 2015 Annapurna Labs Ltd. (HAL code)
- * Copyright (C) 2024 SecFirstNAS contributors (Linux driver glue, kernel 6.12 port)
+ * Copyright (C) 2024-2026 SecFirstNAS contributors (driver, async rewrite)
  */
 
 #include <linux/module.h>
@@ -28,94 +32,83 @@
 #include <linux/crypto.h>
 #include <linux/scatterlist.h>
 #include <linux/workqueue.h>
-#include <linux/completion.h>
 #include <linux/spinlock.h>
 #include <linux/slab.h>
+#include <linux/delay.h>
 
 #include <crypto/internal/skcipher.h>
-#include <crypto/internal/aead.h>
 #include <crypto/aes.h>
 #include <crypto/xts.h>
-#include <crypto/gcm.h>
 #include <crypto/scatterwalk.h>
 #include <crypto/algapi.h>
 
-/* HAL includes */
 #include "al_hal_ssm.h"
 #include "al_hal_ssm_crypto.h"
 #include "al_hal_unit_adapter.h"
 
 #define DRV_NAME	"al_ssm"
-#define DRV_VERSION	"1.0.0"
+#define DRV_VERSION	"2.0.4"
 
-/* PCI device identification */
 #define AL_SSM_VENDOR_ID	0x1c36
 #define AL_SSM_DEVICE_ID	0x0022
-#define AL_SSM_CLASS_CRYPTO	0x100000  /* Network & encryption controller */
+#define AL_SSM_CLASS_CRYPTO	0x100000
 
-/* DMA ring sizes - must be power of 2 */
 #define AL_SSM_RING_SIZE	256
-#define AL_SSM_MAX_CHANNELS	4
-#define AL_SSM_SA_CACHE_SIZE	16
-
-/* Timeout for synchronous crypto operations */
-#define AL_SSM_TIMEOUT_MS	1000
-
-/* Maximum data size per single operation (256KB) */
+#define AL_SSM_MAX_BACKLOG	4096
+#define AL_SSM_SUBMIT_RETRIES	10
+#define AL_SSM_POLL_INTERVAL_US	100
 #define AL_SSM_MAX_DATA_SIZE	(256 * 1024)
+#define RING_BYTES		(AL_SSM_RING_SIZE * sizeof(union al_udma_desc))
 
-/**
- * struct al_ssm_sa_entry - Cached Security Association
- * @sa:       HAL SA parameters
- * @hw_sa:    Hardware SA (written to SA cache)
- * @hw_sa_dma: DMA address of hw_sa
- * @in_use:   Whether this cache slot is occupied
+/*
+ * Each crypto operation uses 3 TX descriptors and 1 RX descriptor.
+ * Ring size is 256 entries. With HAL reserving AL_CRYPT_DESC_RES (16)
+ * descriptors for padding, max concurrent ops = (256 - 16) / 3 = 80.
+ * Use 64 for safety margin.
  */
-struct al_ssm_sa_entry {
-	struct al_crypto_sa sa;
+#define AL_SSM_MAX_IN_FLIGHT	64
+
+struct al_ssm_dev;
+
+struct al_ssm_reqctx {
+	struct list_head list;
+	struct skcipher_request *req;
+	struct al_ssm_dev *dev;
+	enum al_crypto_dir dir;
+	void *src_virt;
+	void *dst_virt;
+	u8 *iv_buf;
 	struct al_crypto_hw_sa *hw_sa;
-	dma_addr_t hw_sa_dma;
-	bool in_use;
+	dma_addr_t src_dma;
+	dma_addr_t dst_dma;
+	dma_addr_t sa_dma;
+	dma_addr_t iv_dma;
+	unsigned int nbytes;
 };
 
-/**
- * struct al_ssm_chan - Per-channel (queue) state
- * @dma:         SSM DMA handle (shared, but each queue is independent)
- * @qid:         Queue ID for this channel
- * @lock:        Spinlock protecting this channel's ring
- * @tx_ring:     TX descriptor ring (DMA coherent)
- * @rx_ring:     RX descriptor ring (DMA coherent)
- * @tx_ring_dma: DMA address of TX ring
- * @rx_ring_dma: DMA address of RX ring
- * @comp:        Completion for synchronous operations
- */
 struct al_ssm_chan {
-	struct al_ssm_dma *dma;
-	uint32_t qid;
 	spinlock_t lock;
 	void *tx_ring;
-	void *rx_ring;
 	dma_addr_t tx_ring_dma;
+	void *tx_cdesc;
+	dma_addr_t tx_cdesc_dma;
+	void *rx_ring;
 	dma_addr_t rx_ring_dma;
-	struct completion comp;
+	void *rx_cdesc;
+	dma_addr_t rx_cdesc_dma;
+	struct list_head pending;
+	int pending_count;
 };
 
-/**
- * struct al_ssm_dev - Per-device state
- * @pdev:          PCI device
- * @dev:           Device pointer for DMA API
- * @bar0:          UDMA register base (BAR 0)
- * @bar4:          Application/crypto register base (BAR 4)
- * @bars:          Array of BAR pointers (for HAL)
- * @ssm_dma:       SSM DMA handle
- * @unit_adapter:  Unit adapter handle
- * @unit_info:     SSM unit register info
- * @channels:      Per-queue channel state
- * @num_channels:  Number of active channels
- * @sa_cache:      SA cache entries
- * @sa_lock:       Lock for SA cache management
- * @crypto_registered: Whether crypto algorithms are registered
- */
+struct al_ssm_ctx {
+	struct al_ssm_dev *dev;
+	enum al_crypto_sa_enc_type enc_type;
+	enum al_crypto_sa_aes_ksize aes_ksize;
+	u8 key[AES_MAX_KEY_SIZE];
+	u8 xts_key[AES_MAX_KEY_SIZE];
+	unsigned int keylen;
+};
+
 struct al_ssm_dev {
 	struct pci_dev *pdev;
 	struct device *dev;
@@ -125,450 +118,483 @@ struct al_ssm_dev {
 	struct al_ssm_dma ssm_dma;
 	struct al_unit_adapter unit_adapter;
 	struct al_ssm_unit_regs_info unit_info;
-	struct al_ssm_chan channels[AL_SSM_MAX_CHANNELS];
-	int num_channels;
-	struct al_ssm_sa_entry sa_cache[AL_SSM_SA_CACHE_SIZE];
-	spinlock_t sa_lock;
+	struct al_ssm_chan channel;
 	bool crypto_registered;
+	spinlock_t backlog_lock;
+	struct list_head backlog;
+	atomic_t backlog_count;
+	struct workqueue_struct *wq;
+	struct delayed_work poll_work;
+	atomic_t total_pending;
 };
 
-/* Global device pointer (single SSM instance per SoC) */
 static struct al_ssm_dev *g_ssm_dev;
 
-/*
- * Forward declarations for crypto algorithm templates
- */
-static int al_ssm_xts_setkey(struct crypto_skcipher *tfm, const u8 *key,
-			     unsigned int keylen);
-static int al_ssm_xts_encrypt(struct skcipher_request *req);
-static int al_ssm_xts_decrypt(struct skcipher_request *req);
-static int al_ssm_cbc_setkey(struct crypto_skcipher *tfm, const u8 *key,
-			     unsigned int keylen);
-static int al_ssm_cbc_encrypt(struct skcipher_request *req);
-static int al_ssm_cbc_decrypt(struct skcipher_request *req);
-static int al_ssm_init_tfm(struct crypto_skcipher *tfm);
-static void al_ssm_exit_tfm(struct crypto_skcipher *tfm);
+static void al_ssm_poll_completions(struct work_struct *work);
+static void al_ssm_complete_one(struct al_ssm_reqctx *rctx, int err);
 
-/* ========================================================================
- * Crypto transform context
- * ======================================================================== */
+/* ── DMA resource management ──────────────────────────────────────────── */
 
-/**
- * struct al_ssm_ctx - Per-transform context
- * @dev:       SSM device
- * @enc_type:  HAL encryption type
- * @aes_ksize: HAL AES key size
- * @key:       Encryption key
- * @xts_key:   XTS tweak key (for XTS mode)
- * @keylen:    Key length in bytes
- * @sa_idx:    SA cache index (-1 if not cached)
- */
-struct al_ssm_ctx {
-	struct al_ssm_dev *dev;
-	enum al_crypto_sa_enc_type enc_type;
-	enum al_crypto_sa_aes_ksize aes_ksize;
-	u8 key[AES_MAX_KEY_SIZE];
-	u8 xts_key[AES_MAX_KEY_SIZE];
-	unsigned int keylen;
-	int sa_idx;
-};
-
-/* ========================================================================
- * SA (Security Association) management
- * ======================================================================== */
-
-/**
- * al_ssm_sa_alloc - Allocate a free SA cache slot
- * @dev: SSM device
- *
- * Returns SA index (0..SA_CACHE_SIZE-1) or -1 if cache is full.
- */
-static int __maybe_unused al_ssm_sa_alloc(struct al_ssm_dev *dev)
-{
-	int i;
-	unsigned long flags;
-
-	spin_lock_irqsave(&dev->sa_lock, flags);
-	for (i = 0; i < AL_SSM_SA_CACHE_SIZE; i++) {
-		if (!dev->sa_cache[i].in_use) {
-			dev->sa_cache[i].in_use = true;
-			spin_unlock_irqrestore(&dev->sa_lock, flags);
-			return i;
-		}
-	}
-	spin_unlock_irqrestore(&dev->sa_lock, flags);
-	return -1;
-}
-
-/**
- * al_ssm_sa_free - Release an SA cache slot
- * @dev:    SSM device
- * @sa_idx: SA index to free
- */
-static void al_ssm_sa_free(struct al_ssm_dev *dev, int sa_idx)
-{
-	unsigned long flags;
-
-	if (sa_idx < 0 || sa_idx >= AL_SSM_SA_CACHE_SIZE)
-		return;
-
-	spin_lock_irqsave(&dev->sa_lock, flags);
-	dev->sa_cache[sa_idx].in_use = false;
-	spin_unlock_irqrestore(&dev->sa_lock, flags);
-}
-
-/* ========================================================================
- * Core crypto operation (synchronous, single-buffer)
- * ======================================================================== */
-
-/**
- * al_ssm_do_crypt - Execute a single crypto operation
- * @ctx:    Transform context with key/mode
- * @src:    Source scatterlist
- * @dst:    Destination scatterlist
- * @nbytes: Number of bytes
- * @iv:     Initialization vector
- * @dir:    Direction (encrypt or decrypt)
- *
- * This function linearizes scatter/gather lists, submits to the hardware
- * crypto engine via HAL, polls for completion, then copies back.
- *
- * For dm-crypt, requests are typically single-page (4KB) or contiguous,
- * so the linearization overhead is minimal.
- */
-static int al_ssm_do_crypt(struct al_ssm_ctx *ctx,
-			   struct scatterlist *src,
-			   struct scatterlist *dst,
-			   unsigned int nbytes,
-			   u8 *iv,
-			   enum al_crypto_dir dir)
+static int al_ssm_alloc_resources(struct al_ssm_reqctx *rctx,
+				  struct al_ssm_ctx *ctx,
+				  struct scatterlist *src,
+				  unsigned int nbytes, u8 *iv,
+				  enum al_crypto_dir dir)
 {
 	struct al_ssm_dev *dev = ctx->dev;
-	struct al_ssm_chan *chan;
-	struct al_crypto_transaction xaction;
 	struct al_crypto_sa sa;
-	struct al_crypto_hw_sa *hw_sa = NULL;
-	struct al_buf src_buf, dst_buf;
-	struct al_block src_block, dst_block;
-	dma_addr_t src_dma, dst_dma, sa_dma, iv_dma;
-	void *src_virt = NULL, *dst_virt = NULL;
-	u8 *iv_buf = NULL;
-	int rc = 0;
-	uint32_t comp_status;
-	unsigned long timeout;
-	unsigned long flags;
-	int qid = 0; /* Use queue 0 for now */
 
-	if (!dev || !dev->bar0)
-		return -ENODEV;
+	rctx->dev = dev;
+	rctx->dir = dir;
+	rctx->nbytes = nbytes;
 
 	if (nbytes == 0 || nbytes > AL_SSM_MAX_DATA_SIZE)
 		return -EINVAL;
 
-	chan = &dev->channels[qid];
-
-	/* Allocate bounce buffers for DMA */
-	src_virt = dma_alloc_coherent(dev->dev, nbytes, &src_dma, GFP_KERNEL);
-	if (!src_virt)
+	rctx->src_virt = dma_alloc_coherent(dev->dev, nbytes, &rctx->src_dma, GFP_KERNEL);
+	if (!rctx->src_virt)
 		return -ENOMEM;
+	rctx->dst_virt = dma_alloc_coherent(dev->dev, nbytes, &rctx->dst_dma, GFP_KERNEL);
+	if (!rctx->dst_virt)
+		goto err_free_src;
+	rctx->iv_buf = dma_alloc_coherent(dev->dev, AES_BLOCK_SIZE, &rctx->iv_dma, GFP_KERNEL);
+	if (!rctx->iv_buf)
+		goto err_free_dst;
+	rctx->hw_sa = dma_alloc_coherent(dev->dev, sizeof(*rctx->hw_sa), &rctx->sa_dma, GFP_KERNEL);
+	if (!rctx->hw_sa)
+		goto err_free_iv;
 
-	dst_virt = dma_alloc_coherent(dev->dev, nbytes, &dst_dma, GFP_KERNEL);
-	if (!dst_virt) {
-		rc = -ENOMEM;
-		goto out_free_src;
-	}
+	scatterwalk_map_and_copy(rctx->src_virt, src, 0, nbytes, 0);
+	memcpy(rctx->iv_buf, iv, AES_BLOCK_SIZE);
 
-	/* Allocate IV DMA buffer */
-	iv_buf = dma_alloc_coherent(dev->dev, AES_BLOCK_SIZE, &iv_dma, GFP_KERNEL);
-	if (!iv_buf) {
-		rc = -ENOMEM;
-		goto out_free_dst;
-	}
-
-	/* Copy source data from scatterlist */
-	scatterwalk_map_and_copy(src_virt, src, 0, nbytes, 0);
-
-	/* Copy IV */
-	memcpy(iv_buf, iv, AES_BLOCK_SIZE);
-
-	/* Set up SA */
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_op = AL_CRYPT_ENC;
 	sa.enc_type = ctx->enc_type;
 	sa.aes_ksize = ctx->aes_ksize;
-
-	if (ctx->enc_type == AL_CRYPT_AES_XTS)
+	if (ctx->enc_type == AL_CRYPT_AES_XTS || ctx->enc_type == AL_CRYPT_AES_CTR)
 		sa.cntr_size = AL_CRYPT_CNTR_128_BIT;
-	else if (ctx->enc_type == AL_CRYPT_AES_CTR)
-		sa.cntr_size = AL_CRYPT_CNTR_128_BIT;
-
-	/* Copy encryption key */
 	memcpy(sa.enc_key, ctx->key, min_t(unsigned int, ctx->keylen, sizeof(sa.enc_key)));
-
-	/* For XTS mode, copy tweak key */
 	if (ctx->enc_type == AL_CRYPT_AES_XTS)
 		memcpy(sa.enc_xts_tweak_key, ctx->xts_key,
 		       min_t(unsigned int, ctx->keylen, sizeof(sa.enc_xts_tweak_key)));
+	memcpy(sa.enc_iv, rctx->iv_buf, AES_BLOCK_SIZE);
 
-	/* Copy IV into SA */
-	memcpy(sa.enc_iv, iv_buf, AES_BLOCK_SIZE);
+	memset(rctx->hw_sa, 0, sizeof(*rctx->hw_sa));
+	al_crypto_hw_sa_init(&sa, rctx->hw_sa);
+	return 0;
 
-	/*
-	 * IMPORTANT:
-	 * Don't DMA-map stack memory here. On kernels with VMAP_STACK,
-	 * stack addresses are vmalloc-backed and dma_map_single() will
-	 * reject them ("rejecting DMA map of vmalloc memory"), which can
-	 * cascade into dm-crypt I/O failures.
-	 */
-	hw_sa = dma_alloc_coherent(dev->dev, sizeof(*hw_sa), &sa_dma, GFP_KERNEL);
-	if (!hw_sa) {
-		rc = -ENOMEM;
-		goto out_free_iv;
-	}
-	memset(hw_sa, 0, sizeof(*hw_sa));
-	al_crypto_hw_sa_init(&sa, hw_sa);
+err_free_iv:
+	dma_free_coherent(dev->dev, AES_BLOCK_SIZE, rctx->iv_buf, rctx->iv_dma);
+err_free_dst:
+	dma_free_coherent(dev->dev, nbytes, rctx->dst_virt, rctx->dst_dma);
+err_free_src:
+	dma_free_coherent(dev->dev, nbytes, rctx->src_virt, rctx->src_dma);
+	return -ENOMEM;
+}
 
-	/* Set up source block */
-	src_buf.addr = src_dma;
-	src_buf.len = nbytes;
+static void al_ssm_free_resources(struct al_ssm_reqctx *rctx)
+{
+	struct al_ssm_dev *dev = rctx->dev;
+
+	if (rctx->hw_sa)
+		dma_free_coherent(dev->dev, sizeof(*rctx->hw_sa), rctx->hw_sa, rctx->sa_dma);
+	if (rctx->iv_buf)
+		dma_free_coherent(dev->dev, AES_BLOCK_SIZE, rctx->iv_buf, rctx->iv_dma);
+	if (rctx->dst_virt)
+		dma_free_coherent(dev->dev, rctx->nbytes, rctx->dst_virt, rctx->dst_dma);
+	if (rctx->src_virt)
+		dma_free_coherent(dev->dev, rctx->nbytes, rctx->src_virt, rctx->src_dma);
+}
+
+/* ── Hardware submit + inline completion ───────────────────────────────
+ *
+ * The SSM crypto engine completes most 4KB operations in < 10us.
+ * We submit and immediately spin-poll for completion. If it completes
+ * inline, we return 0 (synchronous success) — no workqueue overhead.
+ *
+ * If the hardware queue is full (ENOSPC), the request goes to the
+ * software backlog. The poll workqueue drains completions and
+ * re-submits backlogged requests.
+ *
+ * This hybrid approach:
+ *   - Fast path: submit → spin-poll → return 0  (majority of requests)
+ *   - Slow path: backlog → workqueue drain → complete async
+ * ──────────────────────────────────────────────────────────────────── */
+
+#define AL_SSM_INLINE_POLL_US	500	/* Max spin-poll time per request */
+
+/**
+ * al_ssm_submit_and_poll - Submit one request and try to complete inline
+ *
+ * Returns:
+ *   0       - completed synchronously, result already in dst_virt
+ *  -ENOSPC  - hardware queue full, caller should backlog
+ *  -EIO     - hardware completion error
+ *  -EINPROGRESS - submitted but not yet complete, added to pending list
+ */
+static int al_ssm_submit_and_poll(struct al_ssm_reqctx *rctx)
+{
+	struct al_ssm_dev *dev = rctx->dev;
+	struct al_ssm_chan *chan = &dev->channel;
+	struct al_crypto_transaction xaction;
+	struct al_buf src_buf, dst_buf;
+	struct al_block src_block, dst_block;
+	unsigned long flags;
+	uint32_t comp_status;
+	ktime_t deadline;
+	int rc;
+
+	src_buf.addr = rctx->src_dma;
+	src_buf.len = rctx->nbytes;
 	src_block.bufs = &src_buf;
 	src_block.num = 1;
-
-	/* Set up destination block */
-	dst_buf.addr = dst_dma;
-	dst_buf.len = nbytes;
+	dst_buf.addr = rctx->dst_dma;
+	dst_buf.len = rctx->nbytes;
 	dst_block.bufs = &dst_buf;
 	dst_block.num = 1;
 
-	/* Set up transaction */
 	memset(&xaction, 0, sizeof(xaction));
-	xaction.dir = dir;
+	xaction.dir = rctx->dir;
 	xaction.flags = AL_SSM_INTERRUPT;
 	xaction.src = src_block;
-	xaction.src_size = nbytes;
+	xaction.src_size = rctx->nbytes;
 	xaction.dst = dst_block;
-
-	/* SA update - push our SA to the engine */
-	xaction.sa_indx = 0; /* Use SA index 0 */
-	xaction.sa_in.addr = sa_dma;
-	xaction.sa_in.len = sizeof(*hw_sa);
-
-	/* Set IV */
-	xaction.enc_iv_in.addr = iv_dma;
+	xaction.sa_indx = 0;
+	xaction.sa_in.addr = rctx->sa_dma;
+	xaction.sa_in.len = sizeof(*rctx->hw_sa);
+	xaction.enc_iv_in.addr = rctx->iv_dma;
 	xaction.enc_iv_in.len = AES_BLOCK_SIZE;
 
-	/* Submit to hardware */
 	spin_lock_irqsave(&chan->lock, flags);
 
-	rc = al_crypto_dma_prepare(&dev->ssm_dma, qid, &xaction);
-	if (rc) {
+	if (chan->pending_count >= AL_SSM_MAX_IN_FLIGHT) {
 		spin_unlock_irqrestore(&chan->lock, flags);
-		dev_err(dev->dev, "crypto prepare failed: %d\n", rc);
-		goto out_unmap_sa;
+		return -ENOSPC;
 	}
 
-	rc = al_crypto_dma_action(&dev->ssm_dma, qid, xaction.tx_descs_count);
+	rc = al_crypto_dma_prepare(&dev->ssm_dma, 0, &xaction);
 	if (rc) {
 		spin_unlock_irqrestore(&chan->lock, flags);
-		dev_err(dev->dev, "crypto action failed: %d\n", rc);
-		goto out_unmap_sa;
+		return -ENOSPC;
 	}
 
-	spin_unlock_irqrestore(&chan->lock, flags);
+	rc = al_crypto_dma_action(&dev->ssm_dma, 0, xaction.tx_descs_count);
+	if (rc) {
+		spin_unlock_irqrestore(&chan->lock, flags);
+		return rc;
+	}
 
-	/* Poll for completion */
-	timeout = jiffies + msecs_to_jiffies(AL_SSM_TIMEOUT_MS);
-	while (time_before(jiffies, timeout)) {
+	/*
+	 * Add to pending list BEFORE polling. Completions are FIFO —
+	 * we must not consume a completion meant for an earlier request.
+	 */
+	list_add_tail(&rctx->list, &chan->pending);
+	chan->pending_count++;
+	atomic_inc(&dev->total_pending);
+
+	/*
+	 * Spin-poll for completion. Drain the pending list in order.
+	 * If OUR request completes, return 0 (sync fast path).
+	 * If timeout, leave it in pending for the workqueue.
+	 */
+	deadline = ktime_add_us(ktime_get(), AL_SSM_INLINE_POLL_US);
+
+	while (ktime_before(ktime_get(), deadline)) {
+		struct al_ssm_reqctx *done;
+
+		rc = al_crypto_dma_completion(&dev->ssm_dma, 0, &comp_status);
+		if (rc <= 0) {
+			cpu_relax();
+			continue;
+		}
+
+		/* FIFO: first pending entry is the one that completed */
+		done = list_first_entry(&chan->pending,
+					struct al_ssm_reqctx, list);
+		list_del(&done->list);
+		chan->pending_count--;
+		atomic_dec(&dev->total_pending);
+
+		if (done == rctx) {
+			/* OUR request completed — sync fast path */
+			spin_unlock_irqrestore(&chan->lock, flags);
+			return comp_status ? -EIO : 0;
+		}
+
+		/* Earlier request completed — finish it */
+		spin_unlock_irqrestore(&chan->lock, flags);
+		al_ssm_complete_one(done, comp_status ? -EIO : 0);
 		spin_lock_irqsave(&chan->lock, flags);
-		rc = al_crypto_dma_completion(&dev->ssm_dma, qid, &comp_status);
-		spin_unlock_irqrestore(&chan->lock, flags);
+	}
 
-		if (rc > 0) {
-			/* Completed */
-			if (comp_status) {
-				dev_err(dev->dev, "crypto completion error: 0x%x\n",
-					comp_status);
-				rc = -EIO;
-				goto out_unmap_sa;
+	/* Timeout — our request stays in pending for the poll workqueue */
+	spin_unlock_irqrestore(&chan->lock, flags);
+	return -EINPROGRESS;
+}
+
+/* ── Completion polling ───────────────────────────────────────────────── */
+
+static void al_ssm_complete_one(struct al_ssm_reqctx *rctx, int err)
+{
+	struct skcipher_request *req = rctx->req;
+
+	if (!err)
+		scatterwalk_map_and_copy(rctx->dst_virt, req->dst, 0, rctx->nbytes, 1);
+	al_ssm_free_resources(rctx);
+	skcipher_request_complete(req, err);
+}
+
+static int al_ssm_poll_channel(struct al_ssm_dev *dev)
+{
+	struct al_ssm_chan *chan = &dev->channel;
+	struct al_ssm_reqctx *rctx;
+	unsigned long flags;
+	uint32_t comp_status;
+	int completed = 0, rc;
+
+	spin_lock_irqsave(&chan->lock, flags);
+	while (!list_empty(&chan->pending)) {
+		rc = al_crypto_dma_completion(&dev->ssm_dma, 0, &comp_status);
+		if (rc <= 0) {
+			if (!list_empty(&chan->pending) && completed == 0) {
+				rctx = list_first_entry(&chan->pending,
+							struct al_ssm_reqctx, list);
+				dev_dbg(dev->dev, "poll: no completion, pending=%d first: dir=%d nbytes=%u\n",
+					chan->pending_count, rctx->dir, rctx->nbytes);
 			}
 			break;
 		}
-		cpu_relax();
+		rctx = list_first_entry(&chan->pending, struct al_ssm_reqctx, list);
+		list_del(&rctx->list);
+		chan->pending_count--;
+		atomic_dec(&dev->total_pending);
+		spin_unlock_irqrestore(&chan->lock, flags);
+
+		dev_dbg(dev->dev, "complete: dir=%d nbytes=%u comp_status=0x%x remaining=%d\n",
+			rctx->dir, rctx->nbytes, comp_status,
+			atomic_read(&dev->total_pending));
+
+		al_ssm_complete_one(rctx, comp_status ? -EIO : 0);
+		completed++;
+
+		spin_lock_irqsave(&chan->lock, flags);
+	}
+	spin_unlock_irqrestore(&chan->lock, flags);
+	return completed;
+}
+
+static void al_ssm_drain_backlog(struct al_ssm_dev *dev)
+{
+	struct al_ssm_reqctx *rctx;
+	unsigned long flags;
+	int rc;
+
+	spin_lock_irqsave(&dev->backlog_lock, flags);
+	while (!list_empty(&dev->backlog)) {
+		rctx = list_first_entry(&dev->backlog, struct al_ssm_reqctx, list);
+		list_del(&rctx->list);
+		atomic_dec(&dev->backlog_count);
+		spin_unlock_irqrestore(&dev->backlog_lock, flags);
+
+		rc = al_ssm_submit_and_poll(rctx);
+		if (rc == -ENOSPC) {
+			/* Still full — put it back and stop */
+			spin_lock_irqsave(&dev->backlog_lock, flags);
+			list_add(&rctx->list, &dev->backlog);
+			atomic_inc(&dev->backlog_count);
+			break;
+		}
+		if (rc == 0) {
+			/* Completed synchronously */
+			scatterwalk_map_and_copy(rctx->dst_virt, rctx->req->dst,
+						 0, rctx->nbytes, 1);
+			al_ssm_free_resources(rctx);
+			skcipher_request_complete(rctx->req, 0);
+		} else if (rc == -EINPROGRESS) {
+			/* In pending list, poll will complete it */
+		} else {
+			/* Error */
+			al_ssm_free_resources(rctx);
+			skcipher_request_complete(rctx->req, rc);
+		}
+
+		spin_lock_irqsave(&dev->backlog_lock, flags);
+	}
+	spin_unlock_irqrestore(&dev->backlog_lock, flags);
+}
+
+static void al_ssm_poll_completions(struct work_struct *work)
+{
+	struct delayed_work *dw = to_delayed_work(work);
+	struct al_ssm_dev *dev = container_of(dw, struct al_ssm_dev, poll_work);
+	int completed;
+	int pending;
+
+	completed = al_ssm_poll_channel(dev);
+	if (completed > 0)
+		al_ssm_drain_backlog(dev);
+
+	pending = atomic_read(&dev->total_pending) + atomic_read(&dev->backlog_count);
+
+	dev_dbg(dev->dev, "poll_work: completed=%d pending=%d\n", completed, pending);
+
+	if (pending > 0) {
+		mod_delayed_work(dev->wq, &dev->poll_work,
+				 completed > 0 ? 0 : usecs_to_jiffies(AL_SSM_POLL_INTERVAL_US));
+	}
+	/*
+	 * If pending == 0, we stop polling. New requests will restart
+	 * via al_ssm_schedule_poll() in al_ssm_enqueue().
+	 * mod_delayed_work() guarantees the work starts even if it was
+	 * already queued, preventing the race where queue_delayed_work
+	 * silently drops a reschedule.
+	 */
+}
+
+static void al_ssm_schedule_poll(struct al_ssm_dev *dev)
+{
+	mod_delayed_work(dev->wq, &dev->poll_work, 0);
+}
+
+/* ── Async crypto entry ───────────────────────────────────────────────── */
+
+static int al_ssm_enqueue(struct al_ssm_ctx *ctx, struct skcipher_request *req,
+			   enum al_crypto_dir dir)
+{
+	struct al_ssm_dev *dev = ctx->dev;
+	struct al_ssm_reqctx *rctx = skcipher_request_ctx(req);
+	u8 iv[AES_BLOCK_SIZE];
+	unsigned long flags;
+	int rc;
+
+	if (!dev || !dev->bar0)
+		return -ENODEV;
+
+	memcpy(iv, req->iv, AES_BLOCK_SIZE);
+	INIT_LIST_HEAD(&rctx->list);
+	rctx->req = req;
+
+	rc = al_ssm_alloc_resources(rctx, ctx, req->src, req->cryptlen, iv, dir);
+	if (rc)
+		return rc;
+
+	rc = al_ssm_submit_and_poll(rctx);
+
+	if (rc == 0) {
+		/* Completed synchronously — copy result and return success */
+		scatterwalk_map_and_copy(rctx->dst_virt, req->dst,
+					0, rctx->nbytes, 1);
+		al_ssm_free_resources(rctx);
+		return 0;
 	}
 
-	if (rc <= 0) {
-		dev_err(dev->dev, "crypto operation timed out\n");
-		rc = -ETIMEDOUT;
-		goto out_unmap_sa;
+	if (rc == -EINPROGRESS) {
+		/* Submitted but not yet complete — workqueue will finish it */
+		al_ssm_schedule_poll(dev);
+		return -EINPROGRESS;
 	}
 
-	/* Copy result back to destination scatterlist */
-	scatterwalk_map_and_copy(dst_virt, dst, 0, nbytes, 1);
-	rc = 0;
+	if (rc == -ENOSPC) {
+		/* HW queue full — software backlog */
+		spin_lock_irqsave(&dev->backlog_lock, flags);
+		if (atomic_read(&dev->backlog_count) >= AL_SSM_MAX_BACKLOG) {
+			spin_unlock_irqrestore(&dev->backlog_lock, flags);
+			al_ssm_free_resources(rctx);
+			return -EBUSY;
+		}
+		list_add_tail(&rctx->list, &dev->backlog);
+		atomic_inc(&dev->backlog_count);
+		spin_unlock_irqrestore(&dev->backlog_lock, flags);
+		al_ssm_schedule_poll(dev);
+		return -EINPROGRESS;
+	}
 
-out_unmap_sa:
-	if (hw_sa)
-		dma_free_coherent(dev->dev, sizeof(*hw_sa), hw_sa, sa_dma);
-out_free_iv:
-	dma_free_coherent(dev->dev, AES_BLOCK_SIZE, iv_buf, iv_dma);
-out_free_dst:
-	dma_free_coherent(dev->dev, nbytes, dst_virt, dst_dma);
-out_free_src:
-	dma_free_coherent(dev->dev, nbytes, src_virt, src_dma);
+	/* Real error */
+	al_ssm_free_resources(rctx);
 	return rc;
 }
 
-/* ========================================================================
- * Crypto algorithm implementations
- * ======================================================================== */
+/* ── Crypto algorithm callbacks ───────────────────────────────────────── */
 
 static int al_ssm_init_tfm(struct crypto_skcipher *tfm)
 {
 	struct al_ssm_ctx *ctx = crypto_skcipher_ctx(tfm);
-
 	if (!g_ssm_dev)
 		return -ENODEV;
-
 	ctx->dev = g_ssm_dev;
-	ctx->sa_idx = -1;
-
-	/*
-	 * Request extra space for the IV to be stored alongside the request.
-	 * The crypto framework uses this for walking scatterlists.
-	 */
-	crypto_skcipher_set_reqsize(tfm, 0);
-
+	crypto_skcipher_set_reqsize(tfm, sizeof(struct al_ssm_reqctx));
 	return 0;
 }
 
 static void al_ssm_exit_tfm(struct crypto_skcipher *tfm)
 {
 	struct al_ssm_ctx *ctx = crypto_skcipher_ctx(tfm);
-
-	if (ctx->sa_idx >= 0 && ctx->dev)
-		al_ssm_sa_free(ctx->dev, ctx->sa_idx);
-
 	memzero_explicit(ctx->key, sizeof(ctx->key));
 	memzero_explicit(ctx->xts_key, sizeof(ctx->xts_key));
 }
 
-/* ---- AES-XTS ---- */
-
-static int al_ssm_xts_setkey(struct crypto_skcipher *tfm, const u8 *key,
-			     unsigned int keylen)
+static int al_ssm_xts_setkey(struct crypto_skcipher *tfm, const u8 *key, unsigned int keylen)
 {
 	struct al_ssm_ctx *ctx = crypto_skcipher_ctx(tfm);
 	unsigned int half = keylen / 2;
-	int ret;
-
-	/* XTS uses two keys: data key + tweak key */
-	ret = xts_verify_key(tfm, key, keylen);
+	int ret = xts_verify_key(tfm, key, keylen);
 	if (ret)
 		return ret;
-
 	ctx->enc_type = AL_CRYPT_AES_XTS;
-
 	switch (half) {
-	case AES_KEYSIZE_128:
-		ctx->aes_ksize = AL_CRYPT_AES_128;
-		break;
-	case AES_KEYSIZE_256:
-		ctx->aes_ksize = AL_CRYPT_AES_256;
-		break;
-	default:
-		return -EINVAL;
+	case AES_KEYSIZE_128: ctx->aes_ksize = AL_CRYPT_AES_128; break;
+	case AES_KEYSIZE_256: ctx->aes_ksize = AL_CRYPT_AES_256; break;
+	default: return -EINVAL;
 	}
-
 	ctx->keylen = half;
 	memcpy(ctx->key, key, half);
 	memcpy(ctx->xts_key, key + half, half);
-
 	return 0;
 }
 
 static int al_ssm_xts_encrypt(struct skcipher_request *req)
 {
-	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
-	struct al_ssm_ctx *ctx = crypto_skcipher_ctx(tfm);
-	u8 iv[AES_BLOCK_SIZE];
-
-	memcpy(iv, req->iv, AES_BLOCK_SIZE);
-	return al_ssm_do_crypt(ctx, req->src, req->dst, req->cryptlen,
-			       iv, AL_CRYPT_ENCRYPT);
+	return al_ssm_enqueue(crypto_skcipher_ctx(crypto_skcipher_reqtfm(req)), req, AL_CRYPT_ENCRYPT);
 }
 
 static int al_ssm_xts_decrypt(struct skcipher_request *req)
 {
-	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
-	struct al_ssm_ctx *ctx = crypto_skcipher_ctx(tfm);
-	u8 iv[AES_BLOCK_SIZE];
-
-	memcpy(iv, req->iv, AES_BLOCK_SIZE);
-	return al_ssm_do_crypt(ctx, req->src, req->dst, req->cryptlen,
-			       iv, AL_CRYPT_DECRYPT);
+	return al_ssm_enqueue(crypto_skcipher_ctx(crypto_skcipher_reqtfm(req)), req, AL_CRYPT_DECRYPT);
 }
 
-/* ---- AES-CBC ---- */
-
-static int al_ssm_cbc_setkey(struct crypto_skcipher *tfm, const u8 *key,
-			     unsigned int keylen)
+static int al_ssm_cbc_setkey(struct crypto_skcipher *tfm, const u8 *key, unsigned int keylen)
 {
 	struct al_ssm_ctx *ctx = crypto_skcipher_ctx(tfm);
-
 	ctx->enc_type = AL_CRYPT_AES_CBC;
-
 	switch (keylen) {
-	case AES_KEYSIZE_128:
-		ctx->aes_ksize = AL_CRYPT_AES_128;
-		break;
-	case AES_KEYSIZE_192:
-		ctx->aes_ksize = AL_CRYPT_AES_192;
-		break;
-	case AES_KEYSIZE_256:
-		ctx->aes_ksize = AL_CRYPT_AES_256;
-		break;
-	default:
-		return -EINVAL;
+	case AES_KEYSIZE_128: ctx->aes_ksize = AL_CRYPT_AES_128; break;
+	case AES_KEYSIZE_192: ctx->aes_ksize = AL_CRYPT_AES_192; break;
+	case AES_KEYSIZE_256: ctx->aes_ksize = AL_CRYPT_AES_256; break;
+	default: return -EINVAL;
 	}
-
 	ctx->keylen = keylen;
 	memcpy(ctx->key, key, keylen);
-
 	return 0;
 }
 
 static int al_ssm_cbc_encrypt(struct skcipher_request *req)
 {
-	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
-	struct al_ssm_ctx *ctx = crypto_skcipher_ctx(tfm);
-	u8 iv[AES_BLOCK_SIZE];
-
-	memcpy(iv, req->iv, AES_BLOCK_SIZE);
-	return al_ssm_do_crypt(ctx, req->src, req->dst, req->cryptlen,
-			       iv, AL_CRYPT_ENCRYPT);
+	return al_ssm_enqueue(crypto_skcipher_ctx(crypto_skcipher_reqtfm(req)), req, AL_CRYPT_ENCRYPT);
 }
 
 static int al_ssm_cbc_decrypt(struct skcipher_request *req)
 {
-	struct crypto_skcipher *tfm = crypto_skcipher_reqtfm(req);
-	struct al_ssm_ctx *ctx = crypto_skcipher_ctx(tfm);
-	u8 iv[AES_BLOCK_SIZE];
-
-	memcpy(iv, req->iv, AES_BLOCK_SIZE);
-	return al_ssm_do_crypt(ctx, req->src, req->dst, req->cryptlen,
-			       iv, AL_CRYPT_DECRYPT);
+	return al_ssm_enqueue(crypto_skcipher_ctx(crypto_skcipher_reqtfm(req)), req, AL_CRYPT_DECRYPT);
 }
 
-/* ========================================================================
- * Crypto algorithm registration
- * ======================================================================== */
+/* ── Algorithm registration ───────────────────────────────────────────── */
 
 static struct skcipher_alg al_ssm_algs[] = {
 	{
 		.base.cra_name		= "xts(aes)",
 		.base.cra_driver_name	= "xts-aes-al-ssm",
-		.base.cra_priority	= 400, /* Higher than ARM64 NEON (200) */
-		.base.cra_flags		= CRYPTO_ALG_KERN_DRIVER_ONLY,
+		.base.cra_priority	= 400,
+		.base.cra_flags		= CRYPTO_ALG_ASYNC | CRYPTO_ALG_KERN_DRIVER_ONLY,
 		.base.cra_blocksize	= AES_BLOCK_SIZE,
 		.base.cra_ctxsize	= sizeof(struct al_ssm_ctx),
 		.base.cra_module	= THIS_MODULE,
@@ -585,7 +611,7 @@ static struct skcipher_alg al_ssm_algs[] = {
 		.base.cra_name		= "cbc(aes)",
 		.base.cra_driver_name	= "cbc-aes-al-ssm",
 		.base.cra_priority	= 400,
-		.base.cra_flags		= CRYPTO_ALG_KERN_DRIVER_ONLY,
+		.base.cra_flags		= CRYPTO_ALG_ASYNC | CRYPTO_ALG_KERN_DRIVER_ONLY,
 		.base.cra_blocksize	= AES_BLOCK_SIZE,
 		.base.cra_ctxsize	= sizeof(struct al_ssm_ctx),
 		.base.cra_module	= THIS_MODULE,
@@ -600,120 +626,88 @@ static struct skcipher_alg al_ssm_algs[] = {
 	},
 };
 
-/* ========================================================================
- * DMA ring setup
- * ======================================================================== */
+/* ── Channel init with SEPARATE completion rings ──────────────────────── */
 
-/**
- * al_ssm_init_channel - Initialize a single DMA channel (queue)
- * @dev:  SSM device
- * @qid:  Queue ID
- */
-static int al_ssm_init_channel(struct al_ssm_dev *dev, int qid)
+static int al_ssm_init_channel(struct al_ssm_dev *dev)
 {
-	struct al_ssm_chan *chan = &dev->channels[qid];
+	struct al_ssm_chan *chan = &dev->channel;
 	struct al_udma_q_params tx_params, rx_params;
 	int rc;
 
 	spin_lock_init(&chan->lock);
-	init_completion(&chan->comp);
-	chan->dma = &dev->ssm_dma;
-	chan->qid = qid;
+	INIT_LIST_HEAD(&chan->pending);
+	chan->pending_count = 0;
 
-	/* Allocate TX descriptor ring */
-	chan->tx_ring = dma_alloc_coherent(dev->dev,
-					  AL_SSM_RING_SIZE * sizeof(union al_udma_desc),
-					  &chan->tx_ring_dma, GFP_KERNEL);
+	chan->tx_ring = dma_alloc_coherent(dev->dev, RING_BYTES, &chan->tx_ring_dma, GFP_KERNEL);
 	if (!chan->tx_ring)
 		return -ENOMEM;
+	chan->tx_cdesc = dma_alloc_coherent(dev->dev, RING_BYTES, &chan->tx_cdesc_dma, GFP_KERNEL);
+	if (!chan->tx_cdesc)
+		goto err_free_tx;
+	chan->rx_ring = dma_alloc_coherent(dev->dev, RING_BYTES, &chan->rx_ring_dma, GFP_KERNEL);
+	if (!chan->rx_ring)
+		goto err_free_tx_cdesc;
+	chan->rx_cdesc = dma_alloc_coherent(dev->dev, RING_BYTES, &chan->rx_cdesc_dma, GFP_KERNEL);
+	if (!chan->rx_cdesc)
+		goto err_free_rx;
 
-	/* Allocate RX descriptor ring */
-	chan->rx_ring = dma_alloc_coherent(dev->dev,
-					  AL_SSM_RING_SIZE * sizeof(union al_udma_desc),
-					  &chan->rx_ring_dma, GFP_KERNEL);
-	if (!chan->rx_ring) {
-		dma_free_coherent(dev->dev,
-				  AL_SSM_RING_SIZE * sizeof(union al_udma_desc),
-				  chan->tx_ring, chan->tx_ring_dma);
-		return -ENOMEM;
-	}
-
-	/* Initialize TX queue */
 	memset(&tx_params, 0, sizeof(tx_params));
 	tx_params.size = AL_SSM_RING_SIZE;
 	tx_params.desc_base = chan->tx_ring;
 	tx_params.desc_phy_base = chan->tx_ring_dma;
-	tx_params.cdesc_base = chan->tx_ring; /* TX completions reuse the ring */
-	tx_params.cdesc_phy_base = chan->tx_ring_dma;
+	tx_params.cdesc_base = chan->tx_cdesc;
+	tx_params.cdesc_phy_base = chan->tx_cdesc_dma;
 	tx_params.cdesc_size = sizeof(union al_udma_desc);
 
-	/* Initialize RX queue */
 	memset(&rx_params, 0, sizeof(rx_params));
 	rx_params.size = AL_SSM_RING_SIZE;
 	rx_params.desc_base = chan->rx_ring;
 	rx_params.desc_phy_base = chan->rx_ring_dma;
-	rx_params.cdesc_base = chan->rx_ring; /* RX completions reuse the ring */
-	rx_params.cdesc_phy_base = chan->rx_ring_dma;
+	rx_params.cdesc_base = chan->rx_cdesc;
+	rx_params.cdesc_phy_base = chan->rx_cdesc_dma;
 	rx_params.cdesc_size = sizeof(union al_udma_desc);
 
-	rc = al_ssm_dma_q_init(&dev->ssm_dma, qid, &tx_params, &rx_params,
-				AL_CRYPT_AUTH_Q);
+	rc = al_ssm_dma_q_init(&dev->ssm_dma, 0, &tx_params, &rx_params, AL_CRYPT_AUTH_Q);
 	if (rc) {
-		dev_err(dev->dev, "failed to init queue %d: %d\n", qid, rc);
-		dma_free_coherent(dev->dev,
-				  AL_SSM_RING_SIZE * sizeof(union al_udma_desc),
-				  chan->rx_ring, chan->rx_ring_dma);
-		dma_free_coherent(dev->dev,
-				  AL_SSM_RING_SIZE * sizeof(union al_udma_desc),
-				  chan->tx_ring, chan->tx_ring_dma);
-		return rc;
+		dev_err(dev->dev, "failed to init queue 0: %d\n", rc);
+		goto err_free_rx_cdesc;
 	}
-
 	return 0;
+
+err_free_rx_cdesc:
+	dma_free_coherent(dev->dev, RING_BYTES, chan->rx_cdesc, chan->rx_cdesc_dma);
+err_free_rx:
+	dma_free_coherent(dev->dev, RING_BYTES, chan->rx_ring, chan->rx_ring_dma);
+err_free_tx_cdesc:
+	dma_free_coherent(dev->dev, RING_BYTES, chan->tx_cdesc, chan->tx_cdesc_dma);
+err_free_tx:
+	dma_free_coherent(dev->dev, RING_BYTES, chan->tx_ring, chan->tx_ring_dma);
+	return rc ? rc : -ENOMEM;
 }
 
-/**
- * al_ssm_free_channel - Free a single DMA channel
- * @dev:  SSM device
- * @qid:  Queue ID
- */
-static void al_ssm_free_channel(struct al_ssm_dev *dev, int qid)
+static void al_ssm_free_channel(struct al_ssm_dev *dev)
 {
-	struct al_ssm_chan *chan = &dev->channels[qid];
-
-	if (chan->rx_ring) {
-		dma_free_coherent(dev->dev,
-				  AL_SSM_RING_SIZE * sizeof(union al_udma_desc),
-				  chan->rx_ring, chan->rx_ring_dma);
-		chan->rx_ring = NULL;
-	}
-
-	if (chan->tx_ring) {
-		dma_free_coherent(dev->dev,
-				  AL_SSM_RING_SIZE * sizeof(union al_udma_desc),
-				  chan->tx_ring, chan->tx_ring_dma);
-		chan->tx_ring = NULL;
-	}
+	struct al_ssm_chan *chan = &dev->channel;
+	if (chan->rx_cdesc)
+		dma_free_coherent(dev->dev, RING_BYTES, chan->rx_cdesc, chan->rx_cdesc_dma);
+	if (chan->rx_ring)
+		dma_free_coherent(dev->dev, RING_BYTES, chan->rx_ring, chan->rx_ring_dma);
+	if (chan->tx_cdesc)
+		dma_free_coherent(dev->dev, RING_BYTES, chan->tx_cdesc, chan->tx_cdesc_dma);
+	if (chan->tx_ring)
+		dma_free_coherent(dev->dev, RING_BYTES, chan->tx_ring, chan->tx_ring_dma);
 }
 
-/* ========================================================================
- * PCI driver
- * ======================================================================== */
+/* ── PCI driver ───────────────────────────────────────────────────────── */
 
 static const struct pci_device_id al_ssm_pci_tbl[] = {
-	/*
-	 * Match by vendor + device + class to distinguish the SSM crypto engine
-	 * (class 0x100000) from the DMA/RAID engine (class 0x010400) which
-	 * shares the same PCI device ID (0x0022).
-	 */
 	{ PCI_VDEVICE(AMAZON_ANNAPURNA_LABS, AL_SSM_DEVICE_ID),
 	  .class = AL_SSM_CLASS_CRYPTO, .class_mask = 0xffffff },
 	{ 0, }
 };
 MODULE_DEVICE_TABLE(pci, al_ssm_pci_tbl);
 
-static int al_ssm_pci_probe(struct pci_dev *pdev,
-			    const struct pci_device_id *ent)
+static int al_ssm_pci_probe(struct pci_dev *pdev, const struct pci_device_id *ent)
 {
 	struct al_ssm_dev *dev;
 	struct al_ssm_dma_params dma_params;
@@ -721,9 +715,7 @@ static int al_ssm_pci_probe(struct pci_dev *pdev,
 	u8 rev_id;
 
 	pci_read_config_byte(pdev, PCI_REVISION_ID, &rev_id);
-
-	dev_info(&pdev->dev,
-		 "Alpine V2 SSM crypto engine found (vendor=%04x dev=%04x class=%06x rev=%d)\n",
+	dev_info(&pdev->dev, "Alpine V2 SSM crypto engine found (vendor=%04x dev=%04x class=%06x rev=%d)\n",
 		 pdev->vendor, pdev->device, pdev->class, rev_id);
 
 	dev = kzalloc(sizeof(*dev), GFP_KERNEL);
@@ -732,112 +724,78 @@ static int al_ssm_pci_probe(struct pci_dev *pdev,
 
 	dev->pdev = pdev;
 	dev->dev = &pdev->dev;
-	spin_lock_init(&dev->sa_lock);
+	spin_lock_init(&dev->backlog_lock);
+	INIT_LIST_HEAD(&dev->backlog);
+	atomic_set(&dev->backlog_count, 0);
+	atomic_set(&dev->total_pending, 0);
 
 	rc = pci_enable_device(pdev);
-	if (rc) {
-		dev_err(&pdev->dev, "failed to enable PCI device: %d\n", rc);
+	if (rc)
 		goto err_free;
-	}
-
 	rc = pci_request_regions(pdev, DRV_NAME);
-	if (rc) {
-		dev_err(&pdev->dev, "failed to request PCI regions: %d\n", rc);
+	if (rc)
 		goto err_disable;
-	}
-
 	pci_set_master(pdev);
 
-	/* Set up DMA mask for 40-bit addressing (Alpine V2 LPAE) */
 	rc = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(40));
-	if (rc) {
-		dev_warn(&pdev->dev, "40-bit DMA not available, trying 32-bit\n");
+	if (rc)
 		rc = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
-		if (rc) {
-			dev_err(&pdev->dev, "failed to set DMA mask: %d\n", rc);
-			goto err_regions;
-		}
-	}
-
-	/* Map BAR 0 - UDMA registers (128KB) */
-	dev->bar0 = pci_iomap(pdev, 0, 0);
-	if (!dev->bar0) {
-		dev_err(&pdev->dev, "failed to map BAR 0\n");
-		rc = -ENOMEM;
+	if (rc)
 		goto err_regions;
-	}
 
-	/* Map BAR 4 - Application/crypto registers (64KB) */
+	dev->bar0 = pci_iomap(pdev, 0, 0);
+	if (!dev->bar0) { rc = -ENOMEM; goto err_regions; }
 	dev->bar4 = pci_iomap(pdev, 4, 0);
-	if (!dev->bar4) {
-		dev_err(&pdev->dev, "failed to map BAR 4\n");
-		rc = -ENOMEM;
-		goto err_unmap_bar0;
-	}
+	if (!dev->bar4) { rc = -ENOMEM; goto err_unmap_bar0; }
 
-	dev_info(&pdev->dev,
-		 "BAR0=%pR mapped at %p, BAR4=%pR mapped at %p\n",
-		 &pdev->resource[0], dev->bar0,
-		 &pdev->resource[4], dev->bar4);
+	dev_info(&pdev->dev, "BAR0=%pR mapped at %p, BAR4=%pR mapped at %p\n",
+		 &pdev->resource[0], dev->bar0, &pdev->resource[4], dev->bar4);
 
-	/* Set up BAR array for HAL */
 	memset(dev->bars, 0, sizeof(dev->bars));
 	dev->bars[0] = dev->bar0;
 	dev->bars[4] = dev->bar4;
 
-	/* Get unit register info from HAL */
 	al_ssm_unit_regs_info_get(dev->bars, AL_CRYPTO_ALPINE_V2_DEV_ID,
 				  AL_SSM_REV_ID_REV2, &dev->unit_info);
 
-	/* Initialize unit adapter */
-	memset(&dev->unit_adapter, 0, sizeof(dev->unit_adapter));
-
-	/* Initialize SSM DMA */
 	memset(&dma_params, 0, sizeof(dma_params));
 	dma_params.rev_id = AL_SSM_REV_ID_REV2;
 	dma_params.udma_regs_base = dev->bar0;
 	dma_params.name = DRV_NAME;
-	dma_params.num_of_queues = 1; /* Start with one queue */
+	dma_params.num_of_queues = 1;
 
 	rc = al_ssm_dma_init(&dev->ssm_dma, &dma_params);
-	if (rc) {
-		dev_err(&pdev->dev, "failed to init SSM DMA: %d\n", rc);
+	if (rc)
 		goto err_unmap_bar4;
-	}
-
-	/* Enable DMA */
 	rc = al_ssm_dma_state_set(&dev->ssm_dma, UDMA_NORMAL);
-	if (rc) {
-		dev_err(&pdev->dev, "failed to enable SSM DMA: %d\n", rc);
+	if (rc)
 		goto err_unmap_bar4;
-	}
-
-	/* Initialize channel 0 */
-	rc = al_ssm_init_channel(dev, 0);
-	if (rc) {
-		dev_err(&pdev->dev, "failed to init channel 0: %d\n", rc);
+	rc = al_ssm_init_channel(dev);
+	if (rc)
 		goto err_dma_disable;
-	}
-	dev->num_channels = 1;
+
+	dev->wq = alloc_workqueue("al_ssm_wq", WQ_HIGHPRI | WQ_UNBOUND, 0);
+	if (!dev->wq) { rc = -ENOMEM; goto err_free_channel; }
+	INIT_DELAYED_WORK(&dev->poll_work, al_ssm_poll_completions);
 
 	pci_set_drvdata(pdev, dev);
 	g_ssm_dev = dev;
 
-	/* Register crypto algorithms */
 	rc = crypto_register_skciphers(al_ssm_algs, ARRAY_SIZE(al_ssm_algs));
-	if (rc) {
-		dev_err(&pdev->dev, "failed to register crypto algorithms: %d\n", rc);
-		goto err_free_channels;
-	}
+	if (rc)
+		goto err_destroy_wq;
 	dev->crypto_registered = true;
 
 	dev_info(&pdev->dev,
-		 "Alpine V2 SSM crypto engine initialized: AES-XTS, AES-CBC (hw accelerated)\n");
-
+		 "Alpine V2 SSM crypto engine initialized: AES-XTS, AES-CBC "
+		 "(async, ring %d, max %d in-flight, separate completion rings)\n",
+		 AL_SSM_RING_SIZE, AL_SSM_MAX_IN_FLIGHT);
 	return 0;
 
-err_free_channels:
-	al_ssm_free_channel(dev, 0);
+err_destroy_wq:
+	destroy_workqueue(dev->wq);
+err_free_channel:
+	al_ssm_free_channel(dev);
 err_dma_disable:
 	al_ssm_dma_state_set(&dev->ssm_dma, UDMA_DISABLE);
 err_unmap_bar4:
@@ -856,36 +814,34 @@ err_free:
 static void al_ssm_pci_remove(struct pci_dev *pdev)
 {
 	struct al_ssm_dev *dev = pci_get_drvdata(pdev);
-	int i;
+	struct al_ssm_reqctx *rctx, *tmp;
 
 	if (!dev)
 		return;
-
-	/* Unregister crypto algorithms */
 	if (dev->crypto_registered) {
 		crypto_unregister_skciphers(al_ssm_algs, ARRAY_SIZE(al_ssm_algs));
 		dev->crypto_registered = false;
 	}
+	cancel_delayed_work_sync(&dev->poll_work);
+	destroy_workqueue(dev->wq);
 
-	/* Free channels */
-	for (i = 0; i < dev->num_channels; i++)
-		al_ssm_free_channel(dev, i);
+	list_for_each_entry_safe(rctx, tmp, &dev->backlog, list) {
+		list_del(&rctx->list);
+		al_ssm_complete_one(rctx, -ESHUTDOWN);
+	}
+	list_for_each_entry_safe(rctx, tmp, &dev->channel.pending, list) {
+		list_del(&rctx->list);
+		al_ssm_complete_one(rctx, -ESHUTDOWN);
+	}
 
-	/* Disable DMA */
+	al_ssm_free_channel(dev);
 	al_ssm_dma_state_set(&dev->ssm_dma, UDMA_DISABLE);
-
-	/* Unmap BARs */
-	if (dev->bar4)
-		pci_iounmap(pdev, dev->bar4);
-	if (dev->bar0)
-		pci_iounmap(pdev, dev->bar0);
-
+	if (dev->bar4) pci_iounmap(pdev, dev->bar4);
+	if (dev->bar0) pci_iounmap(pdev, dev->bar0);
 	pci_release_regions(pdev);
 	pci_disable_device(pdev);
-
 	g_ssm_dev = NULL;
 	kfree(dev);
-
 	dev_info(&pdev->dev, "Alpine V2 SSM crypto engine removed\n");
 }
 
